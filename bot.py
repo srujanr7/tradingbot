@@ -40,8 +40,8 @@ MAX_FNO_POS    = 2
 MIN_CONFIDENCE = 0.70
 
 # ── Trading Mode — controlled via Telegram ────────────────────
-TRADE_MODE    = "MIS"   # "MIS" = intraday, "CNC" = delivery
-TRADE_CAPITAL = None    # None = use all available, or ₹ amount via /setcapital
+TRADE_MODE    = "MIS"   # MIS | CNC | MTF | MARGIN
+TRADE_CAPITAL = None    # None = use all available, or ₹ amount
 # ─────────────────────────────────────────────────────────────
 
 api      = INDstocksAPI()
@@ -124,24 +124,37 @@ def get_candles(scrip_code: str):
     return api.get_historical(scrip_code, INTERVAL, start, end)
 
 def get_balance(segment: str) -> float:
+    """Returns available balance based on current TRADE_MODE."""
     funds = api.get_funds()
     if not funds:
         return 0.0
     avl = funds.get("detailed_avl_balance", {})
 
     if segment == "EQUITY":
-        # Use MIS or CNC based on TRADE_MODE
         if TRADE_MODE == "MIS":
             raw = avl.get("eq_mis", 0.0)
-        else:
+        elif TRADE_MODE == "MTF":
+            raw = avl.get("eq_mtf", 0.0)
+        else:  # CNC
             raw = avl.get("eq_cnc", 0.0)
+    elif segment == "DERIVATIVE":
+        if TRADE_MODE == "MARGIN":
+            raw = avl.get("future", 0.0)
+        else:
+            raw = avl.get("option_buy", 0.0)
     else:
-        raw = avl.get("future", 0.0)
+        raw = 0.0
 
-    # Cap to TRADE_CAPITAL if set via /setcapital
     if TRADE_CAPITAL is not None:
         return min(raw, TRADE_CAPITAL)
     return raw
+
+def get_all_balances() -> dict:
+    """Returns full funds breakdown for /funds command."""
+    funds = api.get_funds()
+    if not funds:
+        return {}
+    return funds
 
 # ── Core cycle ────────────────────────────────────────────────
 
@@ -245,7 +258,10 @@ def run_cycle():
 # ── Entry ─────────────────────────────────────────────────────
 
 def process_entry(cfg: dict, result: dict, ltp: float):
-    balance = get_balance(cfg["segment"])
+    # Auto-detect correct segment based on TRADE_MODE
+    effective_segment = "DERIVATIVE" if TRADE_MODE == "MARGIN" else cfg["segment"]
+
+    balance = get_balance(effective_segment)
 
     if not risk.can_trade(balance):
         limit = risk.get_daily_limit(balance)
@@ -258,17 +274,16 @@ def process_entry(cfg: dict, result: dict, ltp: float):
 
     qty = posmgr.position_size(
         balance, ltp,
-        cfg["segment"],
+        effective_segment,
         result["confidence"]
     )
 
-    # Apply per-trade limit set via /setlimit
     qty = risk.apply_per_trade_limit(qty, ltp)
 
     margin = api.check_margin(
         cfg["security_id"], qty, ltp,
-        segment=cfg["segment"],
-        product=TRADE_MODE        # ← uses live TRADE_MODE
+        segment=effective_segment,
+        product=TRADE_MODE
     )
     if margin and margin["total_margin"] > balance:
         notifier.insufficient_margin(
@@ -284,8 +299,8 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         qty=qty,
         order_type="LIMIT",
         limit_price=round(ltp * 1.001, 2),
-        segment=cfg["segment"],
-        product=TRADE_MODE,       # ← uses live TRADE_MODE
+        segment=effective_segment,
+        product=TRADE_MODE,
         exchange=cfg["exchange"]
     )
 
@@ -293,7 +308,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         fill      = order_feed.wait_for_fill(
             order["order_id"],
             timeout=30,
-            segment=cfg["segment"]
+            segment=effective_segment
         )
         avg_price = fill.get("average_price", ltp)
 
@@ -307,7 +322,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         posmgr.open_position(
             scrip_code=cfg["scrip_code"],
             name=cfg["name"],
-            segment=cfg["segment"],
+            segment=effective_segment,
             qty=qty,
             entry_price=avg_price,
             order_id=order["order_id"],
@@ -316,7 +331,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         notifier.trade_executed(
             side="BUY",
             name=cfg["name"],
-            segment=cfg["segment"],
+            segment=effective_segment,
             qty=qty,
             price=avg_price,
             confidence=result["confidence"],
@@ -336,8 +351,8 @@ def process_exit(cfg: dict, ltp: float):
         security_id=cfg["security_id"],
         qty=pos["qty"],
         order_type="MARKET",
-        segment=cfg["segment"],
-        product=TRADE_MODE,       # ← uses live TRADE_MODE
+        segment=pos["segment"],
+        product=TRADE_MODE,
         exchange=cfg["exchange"]
     )
 
@@ -345,7 +360,7 @@ def process_exit(cfg: dict, ltp: float):
         fill       = order_feed.wait_for_fill(
             order["order_id"],
             timeout=30,
-            segment=cfg["segment"]
+            segment=pos["segment"]
         )
         exit_price = fill.get("average_price", ltp)
         closed     = posmgr.close_position(cfg["scrip_code"], exit_price)

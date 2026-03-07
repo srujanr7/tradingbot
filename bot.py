@@ -94,8 +94,13 @@ def is_market_open() -> bool:
     return MARKET_OPEN <= now <= MARKET_CLOSE
 
 def get_candles(scrip_code: str):
+    """
+    Fetch last 5 days of 15-min candles.
+    5 days stays safely within the 7-day API limit and gives
+    ~100 candles on trading days — enough for all indicators.
+    """
     end   = int(time.time() * 1000)
-    start = end - (7 * 24 * 60 * 60 * 1000)
+    start = end - (5 * 24 * 60 * 60 * 1000)
     return api.get_historical(scrip_code, INTERVAL, start, end)
 
 def get_balance(segment: str) -> float:
@@ -133,10 +138,15 @@ def run_cycle():
             if not ltp:
                 return
 
+            # Fetch candles with one retry on insufficient data
             df = get_candles(cfg["scrip_code"])
-            if df is None or len(df) < 50:
+            if df is None or len(df) < 30:
+                time.sleep(2)
+                df = get_candles(cfg["scrip_code"])
+            if df is None or len(df) < 30:
                 logger.warning(
-                    f"[{cfg['name']}] Insufficient candle data, skipping."
+                    f"[{cfg['name']}] Insufficient candle data "
+                    f"({len(df) if df is not None else 0} candles), skipping."
                 )
                 return
 
@@ -244,7 +254,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         fill      = order_feed.wait_for_fill(
             order["order_id"],
             timeout=30,
-            segment=cfg["segment"]   # pass segment for REST poll
+            segment=cfg["segment"]
         )
         avg_price = fill.get("average_price", ltp)
 
@@ -296,7 +306,7 @@ def process_exit(cfg: dict, ltp: float):
         fill       = order_feed.wait_for_fill(
             order["order_id"],
             timeout=30,
-            segment=cfg["segment"]   # pass segment for REST poll
+            segment=cfg["segment"]
         )
         exit_price = fill.get("average_price", ltp)
         closed     = posmgr.close_position(cfg["scrip_code"], exit_price)
@@ -375,7 +385,7 @@ if __name__ == "__main__":
     price_feed.instruments = scanner.get_ws_tokens()
     price_feed.start()
 
-    # Step 4: Start order feed (REST polling mode — no WebSocket)
+    # Step 4: Start order feed (REST polling mode)
     order_feed.start()
 
     time.sleep(2)
@@ -399,7 +409,13 @@ if __name__ == "__main__":
 
     logger.info("✅ All systems running — scanning full NSE market")
 
-    # Step 9: Main loop
+    # Step 9: Wait 3 minutes for initial model training to settle
+    # before the first live cycle fires, avoiding API rate limit
+    # collision between trainer data fetches and live candle fetches
+    logger.info("⏳ Waiting 3 minutes for initial model training...")
+    time.sleep(180)
+
+    # Step 10: Main loop
     while True:
         try:
             schedule.run_pending()

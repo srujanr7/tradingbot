@@ -4,6 +4,7 @@ import threading
 import logging
 import time
 import os
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,19 +20,19 @@ class PriceFeed:
     WS_URL = "wss://ws-prices.indstocks.com/api/v1/ws/prices"
 
     def __init__(self, instruments: list, mode: str = "ltp", on_tick=None):
-        self.instruments = instruments
-        self.mode = mode
-        self.on_tick = on_tick
-        self.token = os.getenv("INDSTOCKS_TOKEN")
-        self.ws = None
-        self._running = False
+        self.instruments   = instruments
+        self.mode          = mode
+        self.on_tick       = on_tick
+        self.token         = os.getenv("INDSTOCKS_TOKEN")
+        self.ws            = None
+        self._running      = False
         self.latest_prices = {}
 
     def _on_open(self, ws):
         logger.info("✅ Price feed connected")
         ws.send(json.dumps({
-            "action": "subscribe",
-            "mode": self.mode,
+            "action":      "subscribe",
+            "mode":        self.mode,
             "instruments": self.instruments
         }))
 
@@ -42,7 +43,7 @@ class PriceFeed:
                 return
             if data["mode"] == "ltp":
                 token = data["instrument"]
-                ltp = data["data"]["ltp"]
+                ltp   = data["data"]["ltp"]
                 self.latest_prices[token] = ltp
                 if self.on_tick:
                     self.on_tick(token, ltp)
@@ -60,14 +61,14 @@ class PriceFeed:
     def _on_close(self, ws, code, msg):
         logger.warning(f"Price feed closed: {code} {msg}")
         if self._running:
-            logger.info("Reconnecting in 5s...")
+            logger.info("Price feed reconnecting in 5s...")
             time.sleep(5)
             self._connect()
 
     def _connect(self):
         self.ws = websocket.WebSocketApp(
             self.WS_URL,
-            header=[f"Authorization: {self.token}"],  # FIX 1: list of strings
+            header=[f"Authorization: {self.token}"],
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
@@ -92,15 +93,19 @@ class PriceFeed:
 
 
 class OrderFeed:
-    WS_URL = "wss://ws-order-updates.indstocks.com"
+    """
+    Streams real-time order status updates.
+    Falls back to REST polling if WebSocket is unavailable.
+    """
+    WS_URL = "wss://ws-order-updates.indstocks.com/"
 
     def __init__(self, on_update=None):
         self.on_update    = on_update
         self.token        = os.getenv("INDSTOCKS_TOKEN")
         self.ws           = None
         self._running     = False
+        self._ws_alive    = False
         self.order_states = {}
-        self._ws_alive    = False  # track if WS actually connected
 
     def _on_open(self, ws):
         logger.info("✅ Order feed connected")
@@ -113,6 +118,7 @@ class OrderFeed:
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
+            # Ignore heartbeats — they won't have "type": "order"
             if data.get("type") == "order":
                 order_id = data["order_id"]
                 status   = data["order_status"]
@@ -158,54 +164,89 @@ class OrderFeed:
         if self.ws:
             self.ws.close()
 
-    def _poll_order_rest(self, order_id: str) -> dict:
+    def _poll_order_rest(self, order_id: str, segment: str = "EQUITY") -> dict:
         """
         REST fallback when WebSocket is unavailable.
-        Calls GET /orders/{order_id} directly.
+        Matches GET /order which takes order_id + segment as JSON body.
+        Normalises response to same shape as WebSocket order update.
         """
-        import requests
         try:
             resp = requests.get(
-                f"https://api.indstocks.com/orders/{order_id}",
-                headers={"Authorization": self.token},
+                "https://api.indstocks.com/order",
+                headers={
+                    "Authorization": self.token,
+                    "Content-Type":  "application/json"
+                },
+                json={
+                    "order_id": order_id,
+                    "segment":  segment
+                },
                 timeout=10
             )
             if resp.status_code == 200:
-                data = resp.json()
-                # Normalise to same shape as WS order update
+                raw    = resp.json().get("data", {})
+                status = raw.get("status", "")
+                # Normalise REST status names to match WebSocket names
+                status_map = {
+                    "PARTIALLY FILLED":            "PARTIALLY_EXECUTED",
+                    "PARTIALLY FILLED - CANCELLED": "PARTIALLY_EXECUTED",
+                    "PARTIALLY FILLED - EXPIRED":   "PARTIALLY_EXECUTED",
+                }
+                status = status_map.get(status, status)
+                traded_qty    = int(raw.get("traded_qty", 0) or 0)
+                requested_qty = int(raw.get("requested_qty", 0) or 0)
+                traded_price  = raw.get("traded_price", 0)
+                try:
+                    avg_price = float(traded_price) if traded_price else 0.0
+                except (ValueError, TypeError):
+                    avg_price = 0.0
                 return {
                     "order_id":           order_id,
-                    "order_status":       data.get("order_status", ""),
-                    "filled_quantity":    data.get("filled_qty", 0),
-                    "remaining_quantity": data.get("remaining_qty", 0),
-                    "average_price":      data.get("average_price", 0),
+                    "order_status":       status,
+                    "filled_quantity":    traded_qty,
+                    "remaining_quantity": max(requested_qty - traded_qty, 0),
+                    "average_price":      avg_price,
                 }
+            else:
+                logger.warning(
+                    f"Order REST poll returned {resp.status_code} "
+                    f"for {order_id}"
+                )
         except Exception as e:
             logger.error(f"Order REST poll error: {e}")
         return {}
 
-    def wait_for_fill(self, order_id: str, timeout: int = 30) -> dict:
+    def wait_for_fill(self, order_id: str, timeout: int = 30,
+                      segment: str = "EQUITY") -> dict:
         """
-        Wait for order to reach terminal state.
-        Uses WebSocket cache if WS is alive, otherwise falls back to REST polling.
+        Waits for order to reach a terminal state.
+        Uses WebSocket cache if connection is alive,
+        otherwise polls REST every 1s as fallback.
         """
-        terminal = {"SUCCESS", "FAILED", "CANCELLED", "PARTIALLY_EXECUTED"}
-        start    = time.time()
+        terminal = {
+            "SUCCESS", "FAILED", "CANCELLED",
+            "PARTIALLY_EXECUTED", "EXPIRED", "ABORTED"
+        }
+        start = time.time()
 
         while time.time() - start < timeout:
-            # Try WS cache first
+            # Check WebSocket cache first
             state = self.order_states.get(order_id, {})
             if state.get("order_status") in terminal:
                 return state
 
-            # If WS is down, poll REST directly
+            # WS is down — poll REST directly
             if not self._ws_alive:
-                rest_state = self._poll_order_rest(order_id)
+                rest_state = self._poll_order_rest(order_id, segment)
                 if rest_state.get("order_status") in terminal:
                     self.order_states[order_id] = rest_state
+                    logger.info(
+                        f"Order {order_id} confirmed via REST: "
+                        f"{rest_state['order_status']}"
+                    )
                     return rest_state
 
-            time.sleep(0.5)
+            time.sleep(1.0)
 
-        # Final check — return whatever we have
+        logger.warning(f"wait_for_fill timeout for order {order_id}")
         return self.order_states.get(order_id, {})

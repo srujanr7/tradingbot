@@ -1,0 +1,12 @@
+requests
+python-dotenv
+pandas
+pandas-ta
+schedule
+websocket-client
+xgboost
+scikit-learn
+stable-baselines3
+gymnasium
+numpy
+joblib

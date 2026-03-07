@@ -429,4 +429,3 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
-                     returns empty list gracefully if none found

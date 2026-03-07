@@ -49,14 +49,14 @@ posmgr = PositionManager(
 
 # ── ML Trainers ───────────────────────────────────────────────
 trainers      = {}
-_trainer_lock = threading.Lock()  # FIX 2: prevent race condition on init
+_trainer_lock = threading.Lock()
 
 def get_trainer(cfg: dict) -> AutoTrainer:
     """Get or create ML trainer for an instrument. Thread-safe."""
     key = cfg["scrip_code"]
     if key not in trainers:
         with _trainer_lock:
-            if key not in trainers:  # double-checked locking
+            if key not in trainers:
                 trainers[key] = AutoTrainer(
                     cfg["scrip_code"],
                     cfg["security_id"],
@@ -64,10 +64,10 @@ def get_trainer(cfg: dict) -> AutoTrainer:
                 )
                 trainers[key].start_schedule(retrain_time="18:30")
                 logger.info(f"🧠 Trainer created for {cfg['name']}")
-                time.sleep(1.0)  # FIX 2: stagger API calls on trainer init
+                time.sleep(1.0)
     return trainers[key]
 
-# ── WebSocket Feeds ───────────────────────────────────────────
+# ── WebSocket Price Feed ──────────────────────────────────────
 
 def on_price_tick(token, ltp):
     logger.debug(f"Tick → {token}: ₹{ltp}")
@@ -84,6 +84,7 @@ price_feed = PriceFeed(
     mode="ltp",
     on_tick=on_price_tick
 )
+# REST-only order feed — no WebSocket needed at 15min timeframe
 order_feed = OrderFeed(on_update=on_order_update)
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -133,10 +134,10 @@ def run_cycle():
                 return
 
             df = get_candles(cfg["scrip_code"])
-
-            # FIX 6: guard against empty/insufficient candle data
             if df is None or len(df) < 50:
-                logger.warning(f"[{cfg['name']}] Insufficient candle data, skipping.")
+                logger.warning(
+                    f"[{cfg['name']}] Insufficient candle data, skipping."
+                )
                 return
 
             result = get_trainer(cfg).get_signal(df)
@@ -221,7 +222,11 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         product=cfg["product"]
     )
     if margin and margin["total_margin"] > balance:
-        notifier.insufficient_margin(cfg["name"], margin["total_margin"], balance)
+        notifier.insufficient_margin(
+            cfg["name"],
+            margin["total_margin"],
+            balance
+        )
         return
 
     order = api.place_order(
@@ -236,7 +241,11 @@ def process_entry(cfg: dict, result: dict, ltp: float):
     )
 
     if order:
-        fill      = order_feed.wait_for_fill(order["order_id"], timeout=30)
+        fill      = order_feed.wait_for_fill(
+            order["order_id"],
+            timeout=30,
+            segment=cfg["segment"]   # pass segment for REST poll
+        )
         avg_price = fill.get("average_price", ltp)
 
         if fill.get("order_status") == "FAILED":
@@ -284,7 +293,11 @@ def process_exit(cfg: dict, ltp: float):
     )
 
     if order:
-        fill       = order_feed.wait_for_fill(order["order_id"], timeout=30)
+        fill       = order_feed.wait_for_fill(
+            order["order_id"],
+            timeout=30,
+            segment=cfg["segment"]   # pass segment for REST poll
+        )
         exit_price = fill.get("average_price", ltp)
         closed     = posmgr.close_position(cfg["scrip_code"], exit_price)
         pnl        = closed.get("pnl", 0)
@@ -331,6 +344,7 @@ def send_daily_summary():
     )
 
 def refresh_ws_subscriptions():
+    """Update WebSocket subscriptions after each Tier 1 scan."""
     new_tokens = scanner.get_ws_tokens()
     if price_feed.ws:
         try:
@@ -340,7 +354,9 @@ def refresh_ws_subscriptions():
                 "mode":        "ltp",
                 "instruments": new_tokens
             }))
-            logger.info(f"🔄 WebSocket updated: {len(new_tokens)} instruments")
+            logger.info(
+                f"🔄 WebSocket updated: {len(new_tokens)} instruments"
+            )
         except Exception as e:
             logger.error(f"WS subscription update error: {e}")
 
@@ -349,17 +365,28 @@ def refresh_ws_subscriptions():
 if __name__ == "__main__":
     logger.info("🚀 Booting algo bot — Full Market Mode...")
 
+    # Step 1: Load full instrument universe
     scanner.load_universe()
+
+    # Step 2: First Tier 1 scan — shortlist top instruments
     scanner.tier1_scan()
 
+    # Step 3: Start price feed WebSocket with shortlisted tokens
     price_feed.instruments = scanner.get_ws_tokens()
     price_feed.start()
+
+    # Step 4: Start order feed (REST polling mode — no WebSocket)
     order_feed.start()
+
     time.sleep(2)
 
+    # Step 5: Start background Tier 1 refresh every 30 min
     scanner.start_background_refresh()
+
+    # Step 6: Start Telegram command listener
     notifier.start_command_listener(bot_ref=sys.modules[__name__])
 
+    # Step 7: Schedule all jobs
     schedule.every(60).seconds.do(run_cycle)
     schedule.every(30).minutes.do(refresh_ws_subscriptions)
     schedule.every().day.at("09:14").do(daily_reset)
@@ -367,9 +394,12 @@ if __name__ == "__main__":
     schedule.every().day.at("15:30").do(send_daily_summary)
     schedule.every().day.at("00:01").do(scanner.load_universe)
 
+    # Step 8: Startup alert
     notifier.bot_started()
+
     logger.info("✅ All systems running — scanning full NSE market")
 
+    # Step 9: Main loop
     while True:
         try:
             schedule.run_pending()

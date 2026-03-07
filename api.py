@@ -7,18 +7,53 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+
 class INDstocksAPI:
     def __init__(self):
-        self.base_url = "https://api.indstocks.com"
-        self.token = os.getenv("INDSTOCKS_TOKEN")
-        self.headers = {
+        self.base_url       = "https://api.indstocks.com"
+        self.token          = os.getenv("INDSTOCKS_TOKEN")
+        self.headers        = {
             "Authorization": self.token,
-            "Content-Type": "application/json"
+            "Content-Type":  "application/json"
         }
-        self.max_retries = 3
+        self.max_retries    = 3
+        self._token_invalid = False
+
+    def refresh_token(self):
+        """
+        Reload token from environment.
+        On Render, updating the env var and redeploying
+        restarts the process with the new token at boot.
+        This method handles the case where token is updated
+        without a full redeploy (local dev or runtime update).
+        """
+        load_dotenv(override=True)
+        new_token = os.environ.get("INDSTOCKS_TOKEN")
+        if new_token and new_token != self.token:
+            self.token                    = new_token
+            self.headers["Authorization"] = new_token
+            self._token_invalid           = False
+            logger.info("✅ API token refreshed successfully")
+            return True
+        elif new_token == self.token:
+            logger.warning(
+                "Token unchanged — update INDSTOCKS_TOKEN "
+                "in Render Environment and redeploy"
+            )
+        return False
+
+    def is_token_valid(self) -> bool:
+        return not self._token_invalid
 
     def _request(self, method, endpoint, **kwargs):
-        """Core request handler with retry + rate limit logic"""
+        """Core request handler with retry + rate limit logic."""
+        if self._token_invalid:
+            logger.error(
+                "Token is invalid — skipping request. "
+                "Update INDSTOCKS_TOKEN in Render Environment."
+            )
+            return None
+
         url = f"{self.base_url}{endpoint}"
         for attempt in range(self.max_retries):
             try:
@@ -30,35 +65,54 @@ class INDstocksAPI:
                 )
                 if response.status_code == 200:
                     return response.json()
+
                 elif response.status_code == 429:
                     wait = 2 ** attempt
                     logger.warning(f"Rate limited. Waiting {wait}s...")
                     time.sleep(wait)
+
                 elif response.status_code == 403:
-                    logger.error("Token expired or invalid. Regenerate token.")
-                    raise Exception("TokenException: Re-authenticate")
+                    self._token_invalid = True
+                    logger.error(
+                        "❌ Token expired (403). "
+                        "Generate a new token on INDstocks dashboard, "
+                        "update INDSTOCKS_TOKEN in Render Environment, "
+                        "then redeploy."
+                    )
+                    raise Exception("TokenExpired")
+
                 else:
-                    logger.error(f"API Error {response.status_code}: {response.text}")
+                    logger.error(
+                        f"API Error {response.status_code}: {response.text}"
+                    )
                     return None
-            except requests.exceptions.Timeout:
-                logger.warning(f"Timeout on attempt {attempt+1}")
+
+            except Exception as e:
+                if "TokenExpired" in str(e):
+                    raise
+                logger.warning(f"Request error attempt {attempt+1}: {e}")
                 time.sleep(2 ** attempt)
+
         return None
 
-    # ── Market Data ──────────────────────────────────────────
+    # ── Market Data ───────────────────────────────────────────
 
     def get_ltp(self, scrip_codes: str):
         """Get last traded price. scrip_codes = 'NSE_2885,NSE_11536'"""
-        data = self._request("GET", "/market/quotes/ltp",
-                             params={"scrip-codes": scrip_codes})
+        data = self._request(
+            "GET", "/market/quotes/ltp",
+            params={"scrip-codes": scrip_codes}
+        )
         if data:
             return {k: v["live_price"] for k, v in data["data"].items()}
         return {}
 
     def get_full_quote(self, scrip_codes: str):
-        """Get full OHLCV + market depth"""
-        data = self._request("GET", "/market/quotes/full",
-                             params={"scrip-codes": scrip_codes})
+        """Get full OHLCV + market depth."""
+        data = self._request(
+            "GET", "/market/quotes/full",
+            params={"scrip-codes": scrip_codes}
+        )
         return data["data"] if data else {}
 
     def get_historical(self, scrip_code: str, interval: str,
@@ -69,37 +123,44 @@ class INDstocksAPI:
         timestamps in Unix milliseconds (IST)
         """
         import pandas as pd
-        data = self._request("GET", f"/market/historical/{interval}",
-                             params={
-                                 "scrip-codes": scrip_code,
-                                 "start_time": start_ms,
-                                 "end_time": end_ms
-                             })
+        data = self._request(
+            "GET", f"/market/historical/{interval}",
+            params={
+                "scrip-codes": scrip_code,
+                "start_time":  start_ms,
+                "end_time":    end_ms
+            }
+        )
         if data and "candles" in data["data"]:
-            df = pd.DataFrame(data["data"]["candles"],
-                              columns=["timestamp","open","high","low","close","volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df = pd.DataFrame(
+                data["data"]["candles"],
+                columns=["timestamp", "open", "high",
+                         "low", "close", "volume"]
+            )
+            df["timestamp"] = pd.to_datetime(
+                df["timestamp"], unit="ms"
+            )
             return df
         return None
 
-    # ── Orders ───────────────────────────────────────────────
+    # ── Orders ────────────────────────────────────────────────
 
     def place_order(self, txn_type, security_id, qty,
                     order_type="MARKET", limit_price=None,
                     exchange="NSE", segment="EQUITY",
                     product="CNC", is_amo=False):
-        """Place a standard order"""
+        """Place a standard order."""
         payload = {
-            "txn_type": txn_type,        # BUY / SELL
-            "exchange": exchange,
-            "segment": segment,
+            "txn_type":    txn_type,
+            "exchange":    exchange,
+            "segment":     segment,
             "security_id": security_id,
-            "qty": qty,
-            "order_type": order_type,    # MARKET / LIMIT
-            "validity": "DAY",
-            "product": product,          # CNC / INTRADAY / MARGIN
-            "is_amo": is_amo,
-            "algo_id": "99999"
+            "qty":         qty,
+            "order_type":  order_type,
+            "validity":    "DAY",
+            "product":     product,
+            "is_amo":      is_amo,
+            "algo_id":     "99999"
         }
         if order_type == "LIMIT" and limit_price:
             payload["limit_price"] = limit_price
@@ -114,28 +175,30 @@ class INDstocksAPI:
                           limit_price, sl_trigger, sl_limit,
                           tgt_trigger, tgt_limit,
                           exchange="NSE"):
-        """Place GTT order with auto stop-loss + target"""
+        """Place GTT order with auto stop-loss + target."""
         payload = {
-            "txn_type": txn_type,
-            "exchange": exchange,
-            "segment": "DERIVATIVE",
-            "product": "MARGIN",
-            "order_type": "LIMIT",
-            "validity": "DAY",
-            "security_id": security_id,
-            "qty": qty,
-            "limit_price": limit_price,
-            "sl_trigger_price": sl_trigger,
-            "sl_limit_price": sl_limit,
+            "txn_type":          txn_type,
+            "exchange":          exchange,
+            "segment":           "DERIVATIVE",
+            "product":           "MARGIN",
+            "order_type":        "LIMIT",
+            "validity":          "DAY",
+            "security_id":       security_id,
+            "qty":               qty,
+            "limit_price":       limit_price,
+            "sl_trigger_price":  sl_trigger,
+            "sl_limit_price":    sl_limit,
             "tgt_trigger_price": tgt_trigger,
-            "tgt_limit_price": tgt_limit,
-            "algo_id": "99999"
+            "tgt_limit_price":   tgt_limit,
+            "algo_id":           "99999"
         }
         return self._request("POST", "/smart/order", json=payload)
 
     def cancel_order(self, order_id, segment="EQUITY"):
-        return self._request("POST", "/order/cancel",
-                             json={"order_id": order_id, "segment": segment})
+        return self._request(
+            "POST", "/order/cancel",
+            json={"order_id": order_id, "segment": segment}
+        )
 
     def get_order_book(self):
         data = self._request("GET", "/order-book")
@@ -148,8 +211,10 @@ class INDstocksAPI:
         return data["data"] if data else []
 
     def get_positions(self, segment="equity", product="cnc"):
-        data = self._request("GET", "/portfolio/positions",
-                             params={"segment": segment, "product": product})
+        data = self._request(
+            "GET", "/portfolio/positions",
+            params={"segment": segment, "product": product}
+        )
         return data["data"] if data else {}
 
     def get_funds(self):
@@ -157,15 +222,19 @@ class INDstocksAPI:
         return data["data"] if data else {}
 
     def check_margin(self, security_id, qty, price,
-                     segment="EQUITY", txn_type="BUY", product="CNC"):
-        """Check margin before placing order"""
-        data = self._request("GET", "/margin", json={
-            "segment": segment,
-            "txnType": txn_type,
-            "quantity": str(qty),
-            "price": str(price),
-            "product": product,
-            "securityID": security_id,
-            "exchange": "NSE"
-        })
+                     segment="EQUITY", txn_type="BUY",
+                     product="CNC"):
+        """Check margin before placing order."""
+        data = self._request(
+            "GET", "/margin",
+            json={
+                "segment":    segment,
+                "txnType":    txn_type,
+                "quantity":   str(qty),
+                "price":      str(price),
+                "product":    product,
+                "securityID": security_id,
+                "exchange":   "NSE"
+            }
+        )
         return data["data"] if data else None

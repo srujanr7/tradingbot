@@ -1,3 +1,4 @@
+import numpy as np  # FIX 5: moved to top
 import logging
 import time
 import schedule
@@ -28,14 +29,9 @@ class AutoTrainer:
         self.interval     = interval
         self.retrain_days = retrain_days
 
-        self.xgb = XGBSignalModel(
-            model_path=f"ml/xgb_{scrip_code}.pkl"
-        )
-        self.rl = RLAgent(
-            model_path=f"ml/ppo_{scrip_code}"
-        )
+        self.xgb = XGBSignalModel(model_path=f"ml/xgb_{scrip_code}.pkl")
+        self.rl  = RLAgent(model_path=f"ml/ppo_{scrip_code}")
 
-        # Try loading existing models first
         self.xgb.load()
         self.rl.load()
 
@@ -44,10 +40,6 @@ class AutoTrainer:
     # ── Data fetching ─────────────────────────────────────────
 
     def _fetch_training_data(self) -> pd.DataFrame:
-        """
-        Fetch last N days of candles in chunks.
-        INDstocks API max is 7 days per call so we chunk it.
-        """
         all_candles = []
         end_ms      = int(time.time() * 1000)
         chunk_ms    = 6 * 24 * 60 * 60 * 1000
@@ -69,48 +61,34 @@ class AutoTrainer:
             time.sleep(0.5)
 
         if not all_candles:
-            logger.warning(
-                f"No training data for {self.scrip_code}"
-            )
+            logger.warning(f"No training data for {self.scrip_code}")
             return None
 
         df = pd.concat(all_candles).drop_duplicates("timestamp")
         df = df.sort_values("timestamp").reset_index(drop=True)
-        logger.info(
-            f"Fetched {len(df)} candles for {self.scrip_code}"
-        )
+        logger.info(f"Fetched {len(df)} candles for {self.scrip_code}")
         return df
 
     # ── Retraining ────────────────────────────────────────────
 
     def retrain(self):
         start_time = time.time()
-        logger.info(
-            f"Retraining started for {self.scrip_code} "
-            f"at {datetime.now()}"
-        )
+        logger.info(f"Retraining started for {self.scrip_code} at {datetime.now()}")
 
         df = self._fetch_training_data()
         if df is None or len(df) < 200:
-            logger.warning(
-                f"Not enough data for {self.scrip_code}. "
-                f"Skipping retrain."
-            )
+            logger.warning(f"Not enough data for {self.scrip_code}. Skipping retrain.")
             return
 
         features = build_features(df)
         labels   = build_labels(df, horizon=3, threshold=0.005)
 
         if features.empty:
-            logger.warning(
-                f"Empty features for {self.scrip_code}. Skipping."
-            )
+            logger.warning(f"Empty features for {self.scrip_code}. Skipping.")
             return
 
         # ── Retrain XGBoost ───────────────────────────────────
-        new_xgb = XGBSignalModel(
-            model_path=f"ml/xgb_{self.scrip_code}.pkl"
-        )
+        new_xgb = XGBSignalModel(model_path=f"ml/xgb_{self.scrip_code}.pkl")
         try:
             new_xgb.train(features, labels)
         except Exception as e:
@@ -118,9 +96,7 @@ class AutoTrainer:
             return
 
         # ── Retrain RL (only if available) ────────────────────
-        new_rl = RLAgent(
-            model_path=f"ml/ppo_{self.scrip_code}"
-        )
+        new_rl = RLAgent(model_path=f"ml/ppo_{self.scrip_code}")
         if new_rl.available:
             try:
                 aligned          = features.copy()
@@ -130,17 +106,13 @@ class AutoTrainer:
                     aligned["close"],
                     timesteps=300_000
                 )
-                logger.info(
-                    f"RL retrain complete for {self.scrip_code}"
-                )
+                logger.info(f"RL retrain complete for {self.scrip_code}")
             except Exception as e:
                 logger.error(f"RL training failed: {e}")
-                new_rl = self.rl  # Keep old model on failure
+                new_rl = self.rl
         else:
             new_rl = self.rl
-            logger.info(
-                "Skipping RL retrain — using XGBoost only"
-            )
+            logger.info("Skipping RL retrain — using XGBoost only")
 
         # ── Atomic model swap ─────────────────────────────────
         with self._lock:
@@ -148,12 +120,8 @@ class AutoTrainer:
             self.rl  = new_rl
 
         duration = time.time() - start_time
-        logger.info(
-            f"Retrain complete for {self.scrip_code} "
-            f"in {duration:.0f}s"
-        )
+        logger.info(f"Retrain complete for {self.scrip_code} in {duration:.0f}s")
 
-        # Send Telegram notification
         try:
             from notifier import TelegramNotifier
             notifier = TelegramNotifier()
@@ -169,56 +137,37 @@ class AutoTrainer:
     # ── Signal generation ─────────────────────────────────────
 
     def get_signal(self, df: pd.DataFrame) -> dict:
-        """
-        Combine XGBoost + RL votes into final signal.
-        Called by live bot on every cycle.
-        If RL not available, XGBoost carries full weight.
-        """
         with self._lock:
             if df is None or len(df) < 50:
                 return {
-                    "signal":     "HOLD",
-                    "confidence": 0.0,
-                    "xgb":        "HOLD",
-                    "rl":         "HOLD",
-                    "votes":      {"BUY": 0, "SELL": 0, "HOLD": 1}
+                    "signal": "HOLD", "confidence": 0.0,
+                    "xgb": "HOLD", "rl": "HOLD",
+                    "votes": {"BUY": 0, "SELL": 0, "HOLD": 1}
                 }
 
             features = build_features(df)
             if features.empty:
                 return {
-                    "signal":     "HOLD",
-                    "confidence": 0.0,
-                    "xgb":        "HOLD",
-                    "rl":         "HOLD",
-                    "votes":      {"BUY": 0, "SELL": 0, "HOLD": 1}
+                    "signal": "HOLD", "confidence": 0.0,
+                    "xgb": "HOLD", "rl": "HOLD",
+                    "votes": {"BUY": 0, "SELL": 0, "HOLD": 1}
                 }
 
-            # XGBoost prediction
             xgb_result = self.xgb.predict(features)
             xgb_signal = xgb_result["signal"]
             xgb_conf   = xgb_result["confidence"]
 
-            # RL prediction
             try:
                 obs = features.iloc[-1].values
                 rl_action = self.rl.predict(
                     np.append(obs, [0.0, 0.0]).astype(np.float32)
                     if self.rl.available else obs
                 )
-                rl_signal = {
-                    0: "HOLD",
-                    1: "BUY",
-                    2: "SELL"
-                }.get(rl_action, "HOLD")
+                rl_signal = {0: "HOLD", 1: "BUY", 2: "SELL"}.get(rl_action, "HOLD")
             except Exception:
                 rl_signal = "HOLD"
 
-            # Weighted vote
-            # If RL available: XGB=60%, RL=40%
-            # If RL not available: XGB=100%
             votes = {"BUY": 0.0, "SELL": 0.0, "HOLD": 0.0}
-
             if self.rl.available and self.rl.model is not None:
                 votes[xgb_signal] += 0.6 * xgb_conf
                 votes[rl_signal]  += 0.4
@@ -226,7 +175,6 @@ class AutoTrainer:
                 votes[xgb_signal] += xgb_conf
 
             final = max(votes, key=votes.get)
-
             return {
                 "signal":     final,
                 "confidence": votes[final],
@@ -238,22 +186,11 @@ class AutoTrainer:
     # ── Scheduling ────────────────────────────────────────────
 
     def start_schedule(self, retrain_time: str = "18:30"):
-        """
-        Schedule weekly retraining after market close.
-        Also triggers immediate training if no model exists.
-        Runs in background thread.
-        """
         schedule.every().sunday.at(retrain_time).do(self.retrain)
 
         if not self.xgb.is_trained:
-            logger.info(
-                f"No model for {self.scrip_code}. "
-                f"Running initial training..."
-            )
-            threading.Thread(
-                target=self.retrain,
-                daemon=True
-            ).start()
+            logger.info(f"No model for {self.scrip_code}. Running initial training...")
+            threading.Thread(target=self.retrain, daemon=True).start()
 
         def _loop():
             while True:
@@ -267,7 +204,3 @@ class AutoTrainer:
             f"every Sunday at {retrain_time}"
         )
         return thread
-
-
-# Fix missing numpy import in get_signal
-import numpy as np

@@ -8,15 +8,17 @@ from api import INDstocksAPI
 from risk import RiskManager
 from websocket_feed import PriceFeed, OrderFeed
 from ml.trainer import AutoTrainer
+from ml.trade_memory import TradeMemory
 from notifier import TelegramNotifier
 from watchlist import FullMarketScanner
 from position_manager import PositionManager
+import config
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("bot.log"),
+        logging.FileHandler(config.LOG_FILE),
         logging.StreamHandler()
     ]
 )
@@ -30,38 +32,37 @@ try:
 except Exception:
     logger.warning("Could not detect outbound IP")
 
-# ── Config ────────────────────────────────────────────────────
-INTERVAL       = "15minute"
-MARKET_OPEN    = "09:15"
-MARKET_CLOSE   = "15:20"
-SQUAREOFF_AT   = "15:10"
-MAX_EQUITY_POS = 3
-MAX_FNO_POS    = 2
-MIN_CONFIDENCE = 0.70
+# ── Runtime config (adjustable via Telegram) ──────────────────
+TRADE_MODE     = "MIS"
+TRADE_CAPITAL  = None
+MAX_EQUITY_POS = config.MAX_EQUITY_POS
+MAX_FNO_POS    = config.MAX_FNO_POS
+MIN_CONFIDENCE = config.TRADE_CONFIDENCE
 
-# ── Trading Mode — controlled via Telegram ────────────────────
-TRADE_MODE    = "MIS"   # MIS | CNC | MTF | MARGIN
-TRADE_CAPITAL = None    # None = use all available, or ₹ amount
-# ─────────────────────────────────────────────────────────────
-
+# ── Core services ─────────────────────────────────────────────
 api      = INDstocksAPI()
-risk     = RiskManager(max_position_pct=0.02, daily_loss_limit_pct=0.03)
+risk     = RiskManager(
+    max_position_pct    = config.MAX_POSITION_PCT,
+    daily_loss_limit_pct= config.DAILY_LOSS_LIMIT_PCT
+)
 notifier = TelegramNotifier()
 scanner  = FullMarketScanner(
     api,
-    top_n_equity=10,
-    top_n_fno=5,
-    top_n_index=2
+    top_n_equity = 10,
+    top_n_fno    = 5,
+    top_n_index  = 2
 )
 posmgr = PositionManager(
-    max_equity=MAX_EQUITY_POS,
-    max_fno=MAX_FNO_POS,
-    min_confidence=MIN_CONFIDENCE
+    max_equity     = MAX_EQUITY_POS,
+    max_fno        = MAX_FNO_POS,
+    min_confidence = MIN_CONFIDENCE
 )
+trade_memory = TradeMemory()
 
-# ── ML Trainers ───────────────────────────────────────────────
+# ── ML Trainers — one per instrument ─────────────────────────
 trainers      = {}
 _trainer_lock = threading.Lock()
+
 
 def get_trainer(cfg: dict) -> AutoTrainer:
     key = cfg["scrip_code"]
@@ -69,16 +70,23 @@ def get_trainer(cfg: dict) -> AutoTrainer:
         with _trainer_lock:
             if key not in trainers:
                 trainers[key] = AutoTrainer(
-                    cfg["scrip_code"],
-                    cfg["security_id"],
-                    INTERVAL
+                    scrip_code   = cfg["scrip_code"],
+                    security_id  = cfg["security_id"],
+                    interval     = config.CANDLE_INTERVAL,
+                    retrain_days = config.RETRAIN_DAYS
                 )
-                trainers[key].start_schedule(retrain_time="18:30")
-                logger.info(f"🧠 Trainer created for {cfg['name']}")
+                trainers[key].start_schedule(
+                    retrain_time=config.RETRAIN_TIME
+                )
+                logger.info(
+                    f"🧠 Trainer created: {cfg['name']} | "
+                    f"interval={trainers[key].interval}"
+                )
                 time.sleep(1.0)
     return trainers[key]
 
-# ── Token Refresh ─────────────────────────────────────────────
+
+# ── Token refresh ─────────────────────────────────────────────
 
 def refresh_token():
     logger.info("🔑 Daily token refresh alert sending...")
@@ -87,23 +95,25 @@ def refresh_token():
         "INDstocks token expired at 6AM.\n\n"
         "1️⃣ SSH into your Google Cloud VM\n"
         "2️⃣ Run: <code>cd tradingbot && ./update_token.sh</code>\n"
-        "3️⃣ Paste your new INDstocks token when prompted\n"
+        "3️⃣ Paste your new token when prompted\n"
         "4️⃣ Bot restarts automatically\n\n"
-        "⏰ Complete before 9:15AM market open"
+        "⏰ Complete before 9:15AM"
     )
-    logger.info("🔑 Token refresh alert sent via Telegram.")
 
-# ── WebSocket Price Feed ──────────────────────────────────────
+
+# ── WebSocket feeds ───────────────────────────────────────────
 
 def on_price_tick(token, ltp):
     logger.debug(f"Tick → {token}: ₹{ltp}")
+
 
 def on_order_update(order):
     status   = order["order_status"]
     order_id = order["order_id"]
     logger.info(f"📬 {order_id} → {status}")
     if status == "FAILED":
-        notifier.error("OrderFailed", f"Order {order_id} rejected by exchange")
+        notifier.error("OrderFailed", f"Order {order_id} rejected")
+
 
 price_feed = PriceFeed(
     instruments=[],
@@ -112,30 +122,37 @@ price_feed = PriceFeed(
 )
 order_feed = OrderFeed(on_update=on_order_update)
 
+
 # ── Helpers ───────────────────────────────────────────────────
 
 def is_market_open() -> bool:
     now = datetime.now().strftime("%H:%M")
-    return MARKET_OPEN <= now <= MARKET_CLOSE
+    return config.MARKET_OPEN <= now <= config.MARKET_CLOSE
 
-def get_candles(scrip_code: str):
-    end   = int(time.time() * 1000)
-    start = end - (5 * 24 * 60 * 60 * 1000)
-    return api.get_historical(scrip_code, INTERVAL, start, end)
+
+def get_candles(cfg: dict):
+    """
+    Fetches candles using each instrument's own trainer interval.
+    Falls back to config.CANDLE_INTERVAL if trainer not yet created.
+    """
+    trainer  = trainers.get(cfg["scrip_code"])
+    interval = trainer.interval if trainer else config.CANDLE_INTERVAL
+    end      = int(time.time() * 1000)
+    start    = end - (5 * 24 * 60 * 60 * 1000)
+    return api.get_historical(cfg["scrip_code"], interval, start, end)
+
 
 def get_balance(segment: str) -> float:
-    """Returns available balance based on current TRADE_MODE."""
     funds = api.get_funds()
     if not funds:
         return 0.0
     avl = funds.get("detailed_avl_balance", {})
-
     if segment == "EQUITY":
         if TRADE_MODE == "MIS":
             raw = avl.get("eq_mis", 0.0)
         elif TRADE_MODE == "MTF":
             raw = avl.get("eq_mtf", 0.0)
-        else:  # CNC
+        else:
             raw = avl.get("eq_cnc", 0.0)
     elif segment == "DERIVATIVE":
         if TRADE_MODE == "MARGIN":
@@ -144,35 +161,29 @@ def get_balance(segment: str) -> float:
             raw = avl.get("option_buy", 0.0)
     else:
         raw = 0.0
+    return min(raw, TRADE_CAPITAL) if TRADE_CAPITAL else raw
 
-    if TRADE_CAPITAL is not None:
-        return min(raw, TRADE_CAPITAL)
-    return raw
 
 def get_all_balances() -> dict:
-    """Returns full funds breakdown for /funds command."""
     funds = api.get_funds()
-    if not funds:
-        return {}
-    return funds
+    return funds if funds else {}
+
 
 # ── Core cycle ────────────────────────────────────────────────
 
 def run_cycle():
     if not is_market_open():
         return
-
     if notifier.bot_paused:
         logger.info("Bot paused via Telegram.")
         return
-
     if not api.is_token_valid():
         logger.warning("⚠️ Token invalid — skipping cycle.")
         return
 
     active = scanner.get_active()
     if not active:
-        logger.warning("No active instruments. Waiting for scanner.")
+        logger.warning("No active instruments.")
         return
 
     signals      = []
@@ -188,14 +199,14 @@ def run_cycle():
             if not ltp:
                 return
 
-            df = get_candles(cfg["scrip_code"])
+            df = get_candles(cfg)
             if df is None or len(df) < 30:
                 time.sleep(2)
-                df = get_candles(cfg["scrip_code"])
+                df = get_candles(cfg)
             if df is None or len(df) < 30:
                 logger.warning(
-                    f"[{cfg['name']}] Insufficient candle data "
-                    f"({len(df) if df is not None else 0} candles), skipping."
+                    f"[{cfg['name']}] Insufficient candles "
+                    f"({len(df) if df is not None else 0}), skipping."
                 )
                 return
 
@@ -204,13 +215,16 @@ def run_cycle():
             logger.info(
                 f"[{cfg['name']}] ₹{ltp} | "
                 f"{result['signal']} {result['confidence']:.1%} | "
-                f"XGB={result['xgb']} RL={result['rl']}"
+                f"XGB={result['xgb']} LGBM={result.get('lgbm','')} "
+                f"LSTM={result.get('lstm','')} RL={result['rl']} | "
+                f"Pattern={result.get('pattern','NONE')} "
+                f"Regime={result.get('regime','')}"
             )
 
             entry = {"cfg": cfg, "result": result, "ltp": ltp}
 
-            if (posmgr.has_position(cfg["scrip_code"]) and
-                    result["signal"] == "SELL"):
+            if (posmgr.has_position(cfg["scrip_code"])
+                    and result["signal"] == "SELL"):
                 exit_signals.append(entry)
             elif result["signal"] == "BUY":
                 signals.append(entry)
@@ -219,7 +233,9 @@ def run_cycle():
             logger.error(f"Scan error [{cfg['name']}]: {e}")
 
     threads = [
-        threading.Thread(target=scan_instrument, args=(cfg,), daemon=True)
+        threading.Thread(
+            target=scan_instrument, args=(cfg,), daemon=True
+        )
         for cfg in active
     ]
     for t in threads:
@@ -233,7 +249,7 @@ def run_cycle():
     ranked = posmgr.rank_signals(signals)
     logger.info(
         f"📊 {len(ranked)} actionable signals | "
-        f"Equity slots: {posmgr.equity_slots_free()} | "
+        f"EQ slots: {posmgr.equity_slots_free()} | "
         f"FNO slots: {posmgr.fno_slots_free()}"
     )
 
@@ -250,22 +266,23 @@ def run_cycle():
     status = posmgr.status()
     logger.info(
         f"📁 Open: {status['open_positions']} | "
-        f"Equity: {status['equity_open']}/{MAX_EQUITY_POS} | "
+        f"EQ: {status['equity_open']}/{MAX_EQUITY_POS} | "
         f"FNO: {status['fno_open']}/{MAX_FNO_POS} | "
         f"Win rate: {status['win_rate']:.1f}%"
     )
 
+
 # ── Entry ─────────────────────────────────────────────────────
 
 def process_entry(cfg: dict, result: dict, ltp: float):
-    # Auto-detect correct segment based on TRADE_MODE
-    effective_segment = "DERIVATIVE" if TRADE_MODE == "MARGIN" else cfg["segment"]
-
+    effective_segment = (
+        "DERIVATIVE" if TRADE_MODE == "MARGIN" else cfg["segment"]
+    )
     balance = get_balance(effective_segment)
 
     if not risk.can_trade(balance):
-        limit = risk.get_daily_limit(balance)
-        notifier.kill_switch(risk.daily_pnl, limit)
+        notifier.kill_switch(risk.daily_pnl,
+                             risk.get_daily_limit(balance))
         return
 
     limit = risk.get_daily_limit(balance)
@@ -277,38 +294,35 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         effective_segment,
         result["confidence"]
     )
-
     qty = risk.apply_per_trade_limit(qty, ltp)
 
     margin = api.check_margin(
         cfg["security_id"], qty, ltp,
-        segment=effective_segment,
-        product=TRADE_MODE
+        segment = effective_segment,
+        product = TRADE_MODE
     )
     if margin and margin["total_margin"] > balance:
         notifier.insufficient_margin(
-            cfg["name"],
-            margin["total_margin"],
-            balance
+            cfg["name"], margin["total_margin"], balance
         )
         return
 
     order = api.place_order(
-        txn_type="BUY",
-        security_id=cfg["security_id"],
-        qty=qty,
-        order_type="LIMIT",
-        limit_price=round(ltp * 1.001, 2),
-        segment=effective_segment,
-        product=TRADE_MODE,
-        exchange=cfg["exchange"]
+        txn_type    = "BUY",
+        security_id = cfg["security_id"],
+        qty         = qty,
+        order_type  = "LIMIT",
+        limit_price = round(ltp * (1 + config.LIMIT_ORDER_SLIPPAGE), 2),
+        segment     = effective_segment,
+        product     = TRADE_MODE,
+        exchange    = cfg["exchange"]
     )
 
     if order:
         fill      = order_feed.wait_for_fill(
             order["order_id"],
-            timeout=30,
-            segment=effective_segment
+            timeout = config.ORDER_FILL_TIMEOUT,
+            segment = effective_segment
         )
         avg_price = fill.get("average_price", ltp)
 
@@ -320,24 +334,29 @@ def process_entry(cfg: dict, result: dict, ltp: float):
             return
 
         posmgr.open_position(
-            scrip_code=cfg["scrip_code"],
-            name=cfg["name"],
-            segment=effective_segment,
-            qty=qty,
-            entry_price=avg_price,
-            order_id=order["order_id"],
-            signal_meta=result
+            scrip_code  = cfg["scrip_code"],
+            name        = cfg["name"],
+            segment     = effective_segment,
+            qty         = qty,
+            entry_price = avg_price,
+            order_id    = order["order_id"],
+            signal_meta = result
         )
         notifier.trade_executed(
-            side="BUY",
-            name=cfg["name"],
-            segment=effective_segment,
-            qty=qty,
-            price=avg_price,
-            confidence=result["confidence"],
-            xgb=result["xgb"],
-            rl=result["rl"]
+            side       = "BUY",
+            name       = cfg["name"],
+            segment    = effective_segment,
+            qty        = qty,
+            price      = avg_price,
+            confidence = result["confidence"],
+            xgb        = result.get("xgb", ""),
+            rl         = result.get("rl", ""),
+            lgbm       = result.get("lgbm", ""),
+            lstm       = result.get("lstm", ""),
+            pattern    = result.get("pattern", "NONE"),
+            regime     = result.get("regime", "")
         )
+
 
 # ── Exit ──────────────────────────────────────────────────────
 
@@ -347,52 +366,103 @@ def process_exit(cfg: dict, ltp: float):
         return
 
     order = api.place_order(
-        txn_type="SELL",
-        security_id=cfg["security_id"],
-        qty=pos["qty"],
-        order_type="MARKET",
-        segment=pos["segment"],
-        product=TRADE_MODE,
-        exchange=cfg["exchange"]
+        txn_type    = "SELL",
+        security_id = cfg["security_id"],
+        qty         = pos["qty"],
+        order_type  = "MARKET",
+        segment     = pos["segment"],
+        product     = TRADE_MODE,
+        exchange    = cfg["exchange"]
     )
 
     if order:
         fill       = order_feed.wait_for_fill(
             order["order_id"],
-            timeout=30,
-            segment=pos["segment"]
+            timeout = config.ORDER_FILL_TIMEOUT,
+            segment = pos["segment"]
         )
         exit_price = fill.get("average_price", ltp)
         closed     = posmgr.close_position(cfg["scrip_code"], exit_price)
         pnl        = closed.get("pnl", 0)
+        pnl_pct    = (
+            (exit_price - pos["entry"]) / pos["entry"] * 100
+            if pos["entry"] else 0
+        )
         risk.update_pnl(pnl)
 
-        from ml.trade_memory import TradeMemory
-        TradeMemory().record({
-            "scrip_code":   cfg["scrip_code"],
-            "name":         cfg["name"],
-            "segment":      pos["segment"],
-            "side":         "BUY",
-            "entry":        pos["entry"],
-            "exit":         exit_price,
-            "qty":          pos["qty"],
-            "pnl":          pnl,
-            "pnl_pct":      pnl_pct,
-            "hold_minutes": 15,   # approximate
-            "confidence":   pos.get("signal_meta", {}).get("confidence", 0),
-            "xgb":          pos.get("signal_meta", {}).get("xgb", ""),
-            "rl":           pos.get("signal_meta", {}).get("rl", ""),
-            "sentiment":    pos.get("signal_meta", {}).get("sentiment", 0),
+        meta = pos.get("signal_meta", {})
+
+        # ── Feedback loop: update MetaModel weights ───────────
+        trainer = trainers.get(cfg["scrip_code"])
+        if trainer:
+            trainer.record_trade_outcome(
+                signal     = "BUY",
+                entry      = pos["entry"],
+                exit_price = exit_price,
+                xgb_was    = meta.get("xgb", "HOLD"),
+                rl_was     = meta.get("rl",  "HOLD"),
+                sentiment  = meta.get("sentiment", 0.0)
+            )
+
+        # ── Persist to trade memory ───────────────────────────
+        hold_candles = max(
+            1,
+            int(
+                (datetime.now() -
+                 datetime.fromisoformat(pos["opened_at"])
+                ).total_seconds() / 60
+                / _interval_minutes(
+                    trainers[cfg["scrip_code"]].interval
+                    if cfg["scrip_code"] in trainers
+                    else "5minute"
+                )
+            )
+        )
+        trade_memory.record({
+            "scrip_code":    cfg["scrip_code"],
+            "name":          cfg["name"],
+            "segment":       pos["segment"],
+            "side":          "BUY",
+            "entry":         pos["entry"],
+            "exit":          exit_price,
+            "qty":           pos["qty"],
+            "pnl":           pnl,
+            "pnl_pct":       pnl_pct,
+            "hold_candles":  hold_candles,
+            "confidence":    meta.get("confidence", 0),
+            "xgb":           meta.get("xgb", ""),
+            "lgbm":          meta.get("lgbm", ""),
+            "lstm":          meta.get("lstm", ""),
+            "rl":            meta.get("rl", ""),
+            "pattern":       meta.get("pattern", ""),
+            "regime":        meta.get("regime", ""),
+            "sentiment":     meta.get("sentiment", 0),
+            "interval":      (
+                trainers[cfg["scrip_code"]].interval
+                if cfg["scrip_code"] in trainers
+                else ""
+            ),
         })
 
         notifier.trade_closed(
-            name=cfg["name"],
-            qty=pos["qty"],
-            entry=pos["entry"],
-            exit_price=exit_price,
-            pnl=pnl,
-            daily_pnl=risk.daily_pnl
+            name       = cfg["name"],
+            qty        = pos["qty"],
+            entry      = pos["entry"],
+            exit_price = exit_price,
+            pnl        = pnl,
+            daily_pnl  = risk.daily_pnl
         )
+
+
+def _interval_minutes(interval: str) -> int:
+    """Convert interval string to minutes for hold time calc."""
+    mapping = {
+        "1minute": 1, "2minute": 2, "3minute": 3,
+        "5minute": 5, "10minute": 10, "15minute": 15,
+        "30minute": 30, "60minute": 60, "1day": 375
+    }
+    return mapping.get(interval, 5)
+
 
 # ── Scheduled jobs ────────────────────────────────────────────
 
@@ -401,29 +471,36 @@ def square_off_all():
     notifier.squareoff_alert(posmgr.positions)
     for scrip_code, pos in list(posmgr.positions.items()):
         cfg = next(
-            (s for s in scanner.universe_equity + scanner.universe_fno
-             if s["scrip_code"] == scrip_code),
+            (
+                s for s in
+                scanner.universe_equity + scanner.universe_fno
+                if s["scrip_code"] == scrip_code
+            ),
             None
         )
         if cfg:
-            ltp = price_feed.get_ltp(
-                cfg["ws_token"].split(":")[1]
-            ) or pos["entry"]
+            ltp = (
+                price_feed.get_ltp(cfg["ws_token"].split(":")[1])
+                or pos["entry"]
+            )
             process_exit(cfg, ltp)
+
 
 def daily_reset():
     risk.reset_daily()
     logger.info("🔄 Daily counters reset")
 
+
 def send_daily_summary():
     status  = posmgr.status()
     balance = get_balance("EQUITY") + get_balance("DERIVATIVE")
     notifier.daily_summary(
-        total_pnl=risk.daily_pnl,
-        trades=risk.trades_today,
-        wins=status["win_count"],
-        balance=balance
+        total_pnl = risk.daily_pnl,
+        trades    = risk.trades_today,
+        wins      = status["win_count"],
+        balance   = balance
     )
+
 
 def refresh_ws_subscriptions():
     new_tokens = scanner.get_ws_tokens()
@@ -435,9 +512,12 @@ def refresh_ws_subscriptions():
                 "mode":        "ltp",
                 "instruments": new_tokens
             }))
-            logger.info(f"🔄 WebSocket updated: {len(new_tokens)} instruments")
+            logger.info(
+                f"🔄 WS updated: {len(new_tokens)} instruments"
+            )
         except Exception as e:
-            logger.error(f"WS subscription update error: {e}")
+            logger.error(f"WS subscription error: {e}")
+
 
 # ── Boot ──────────────────────────────────────────────────────
 
@@ -449,24 +529,25 @@ if __name__ == "__main__":
 
     price_feed.instruments = scanner.get_ws_tokens()
     price_feed.start()
-
     order_feed.start()
     time.sleep(2)
 
     scanner.start_background_refresh()
     notifier.start_command_listener(bot_ref=sys.modules[__name__])
 
-    schedule.every(60).seconds.do(run_cycle)
+    schedule.every(config.CYCLE_INTERVAL_SECONDS).seconds.do(
+        run_cycle
+    )
     schedule.every(30).minutes.do(refresh_ws_subscriptions)
     schedule.every().day.at("06:30").do(refresh_token)
-    schedule.every().day.at("09:14").do(daily_reset)
-    schedule.every().day.at(SQUAREOFF_AT).do(square_off_all)
+    schedule.every().day.at(config.DAILY_RESET_AT).do(daily_reset)
+    schedule.every().day.at(config.SQUAREOFF_AT).do(square_off_all)
     schedule.every().day.at("15:30").do(send_daily_summary)
     schedule.every().day.at("00:01").do(scanner.load_universe)
 
     notifier.bot_started()
 
-    logger.info("✅ All systems running — scanning full NSE market")
+    logger.info("✅ All systems running")
     logger.info("⏳ Waiting 3 minutes for initial model training...")
     time.sleep(180)
 

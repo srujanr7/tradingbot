@@ -1,10 +1,16 @@
+import sys
 import time
 import logging
 import schedule
+import threading
 from datetime import datetime
 from api import INDstocksAPI
-from strategy import MACrossRSIStrategy
 from risk import RiskManager
+from websocket_feed import PriceFeed, OrderFeed
+from ml.trainer import AutoTrainer
+from notifier import TelegramNotifier
+from watchlist import FullMarketScanner
+from position_manager import PositionManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,109 +23,426 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────
-SCRIP_CODE  = "NSE_2885"      # Reliance — change to your stock
-SECURITY_ID = "2885"          # From instruments CSV
-INTERVAL    = "15minute"      # Candle timeframe
-CHECK_EVERY = 60              # Seconds between checks
-MARKET_OPEN  = "09:15"
-MARKET_CLOSE = "15:20"
+INTERVAL       = "15minute"
+MARKET_OPEN    = "09:15"
+MARKET_CLOSE   = "15:20"
+SQUAREOFF_AT   = "15:10"
+MAX_EQUITY_POS = 3
+MAX_FNO_POS    = 2
+MIN_CONFIDENCE = 0.70
 # ─────────────────────────────────────────────────────────────
 
 api      = INDstocksAPI()
-strategy = MACrossRSIStrategy(fast=9, slow=21)
 risk     = RiskManager(max_position_pct=0.02, daily_loss_limit_pct=0.03)
+notifier = TelegramNotifier()
+scanner  = FullMarketScanner(
+    api,
+    top_n_equity=10,
+    top_n_fno=5,
+    top_n_index=2
+)
+posmgr = PositionManager(
+    max_equity=MAX_EQUITY_POS,
+    max_fno=MAX_FNO_POS,
+    min_confidence=MIN_CONFIDENCE
+)
 
-position = None   # Tracks open position: None or dict
+# ── ML Trainers — created lazily per instrument ───────────────
+trainers = {}
+
+def get_trainer(cfg: dict) -> AutoTrainer:
+    """Get or create ML trainer for an instrument."""
+    key = cfg["scrip_code"]
+    if key not in trainers:
+        trainers[key] = AutoTrainer(
+            cfg["scrip_code"],
+            cfg["security_id"],
+            INTERVAL
+        )
+        trainers[key].start_schedule(retrain_time="18:30")
+        logger.info(f"🧠 Trainer created for {cfg['name']}")
+    return trainers[key]
+
+# ── WebSocket Feeds ───────────────────────────────────────────
+# Starts empty — tokens added after universe loads at boot
+
+def on_price_tick(token, ltp):
+    logger.debug(f"Tick → {token}: ₹{ltp}")
+
+def on_order_update(order):
+    status   = order["order_status"]
+    order_id = order["order_id"]
+    logger.info(f"📬 {order_id} → {status}")
+    if status == "FAILED":
+        notifier.error("OrderFailed", f"Order {order_id} rejected by exchange")
+
+price_feed = PriceFeed(
+    instruments=[],
+    mode="ltp",
+    on_tick=on_price_tick
+)
+order_feed = OrderFeed(on_update=on_order_update)
+
+# ── Helpers ───────────────────────────────────────────────────
 
 def is_market_open() -> bool:
     now = datetime.now().strftime("%H:%M")
     return MARKET_OPEN <= now <= MARKET_CLOSE
 
-def get_candles():
-    """Fetch last 7 days of 15-min candles"""
-    import time as t
-    end   = int(t.time() * 1000)
+def get_candles(scrip_code: str):
+    end   = int(time.time() * 1000)
     start = end - (7 * 24 * 60 * 60 * 1000)
-    return api.get_historical(SCRIP_CODE, INTERVAL, start, end)
+    return api.get_historical(scrip_code, INTERVAL, start, end)
 
-def run_cycle():
-    global position
-
-    if not is_market_open():
-        logger.info("Market closed. Skipping cycle.")
-        return
-
-    # 1. Get account balance
+def get_balance(segment: str) -> float:
     funds = api.get_funds()
     if not funds:
-        logger.error("Could not fetch funds.")
-        return
-    balance = funds.get("detailed_avl_balance", {}).get("eq_cnc", 0)
-    logger.info(f"Available balance (CNC): ₹{balance:.2f}")
+        return 0.0
+    avl = funds.get("detailed_avl_balance", {})
+    return avl.get("eq_cnc" if segment == "EQUITY" else "future", 0.0)
 
-    # 2. Kill switch check
+# ── Core cycle ────────────────────────────────────────────────
+
+def run_cycle():
+    if not is_market_open():
+        return
+
+    if notifier.bot_paused:
+        logger.info("Bot paused via Telegram.")
+        return
+
+    active = scanner.get_active()
+    if not active:
+        logger.warning("No active instruments. Waiting for scanner.")
+        return
+
+    signals      = []
+    exit_signals = []
+
+    # ── Scan all active instruments in parallel ───────────────
+    def scan_instrument(cfg):
+        try:
+            # LTP from WebSocket cache, fallback to REST
+            token = cfg["ws_token"].split(":")[1]
+            ltp   = price_feed.get_ltp(token)
+            if ltp is None:
+                data = api.get_ltp(cfg["scrip_code"])
+                ltp  = data.get(cfg["scrip_code"])
+            if not ltp:
+                return
+
+            df     = get_candles(cfg["scrip_code"])
+            result = get_trainer(cfg).get_signal(df)
+
+            logger.info(
+                f"[{cfg['name']}] ₹{ltp} | "
+                f"{result['signal']} {result['confidence']:.1%} | "
+                f"XGB={result['xgb']} RL={result['rl']}"
+            )
+
+            entry = {"cfg": cfg, "result": result, "ltp": ltp}
+
+            if (posmgr.has_position(cfg["scrip_code"]) and
+                    result["signal"] == "SELL"):
+                exit_signals.append(entry)
+            elif result["signal"] == "BUY":
+                signals.append(entry)
+
+        except Exception as e:
+            logger.error(f"Scan error [{cfg['name']}]: {e}")
+
+    threads = [
+        threading.Thread(target=scan_instrument, args=(cfg,), daemon=True)
+        for cfg in active
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    # ── Exits first ───────────────────────────────────────────
+    for entry in exit_signals:
+        process_exit(entry["cfg"], entry["ltp"])
+
+    # ── Ranked entries ────────────────────────────────────────
+    ranked = posmgr.rank_signals(signals)
+    logger.info(
+        f"📊 {len(ranked)} actionable signals | "
+        f"Equity slots: {posmgr.equity_slots_free()} | "
+        f"FNO slots: {posmgr.fno_slots_free()}"
+    )
+
+    for entry in ranked:
+        can_enter, reason = posmgr.can_enter(
+            entry["cfg"]["segment"],
+            entry["result"]["confidence"]
+        )
+        if not can_enter:
+            logger.info(f"[{entry['cfg']['name']}] Skipped: {reason}")
+            continue
+        process_entry(entry["cfg"], entry["result"], entry["ltp"])
+
+    # ── Portfolio snapshot ────────────────────────────────────
+    status = posmgr.status()
+    logger.info(
+        f"📁 Open: {status['open_positions']} | "
+        f"Equity: {status['equity_open']}/{MAX_EQUITY_POS} | "
+        f"FNO: {status['fno_open']}/{MAX_FNO_POS} | "
+        f"Win rate: {status['win_rate']:.1f}%"
+    )
+
+# ── Entry ─────────────────────────────────────────────────────
+
+def process_entry(cfg: dict, result: dict, ltp: float):
+    balance = get_balance(cfg["segment"])
+
+    # Kill switch check
     if not risk.can_trade(balance):
+        limit = balance * risk.daily_loss_limit_pct
+        notifier.kill_switch(risk.daily_pnl, limit)
         return
 
-    # 3. Get market data + generate signal
-    df = get_candles()
-    signal = strategy.generate_signal(df)
-    ltp    = api.get_ltp(SCRIP_CODE).get(SCRIP_CODE, 0)
-    logger.info(f"Signal: {signal} | LTP: ₹{ltp}")
+    # Warn at 80% of daily loss limit
+    limit = balance * risk.daily_loss_limit_pct
+    if risk.daily_pnl < -(limit * 0.8):
+        notifier.risk_warning(risk.daily_pnl, limit, balance)
 
-    # 4. Execute
-    if signal == "BUY" and position is None:
-        qty = risk.position_size(balance, ltp)
+    qty = posmgr.position_size(
+        balance, ltp,
+        cfg["segment"],
+        result["confidence"]
+    )
 
-        # Check margin first
-        margin = api.check_margin(SECURITY_ID, qty, ltp)
-        if margin and margin["total_margin"] > balance:
-            logger.warning("Insufficient margin. Skipping.")
+    # Margin check
+    margin = api.check_margin(
+        cfg["security_id"], qty, ltp,
+        segment=cfg["segment"],
+        product=cfg["product"]
+    )
+    if margin and margin["total_margin"] > balance:
+        notifier.insufficient_margin(
+            cfg["name"],
+            margin["total_margin"],
+            balance
+        )
+        return
+
+    # Place BUY order
+    order = api.place_order(
+        txn_type="BUY",
+        security_id=cfg["security_id"],
+        qty=qty,
+        order_type="LIMIT",
+        limit_price=round(ltp * 1.001, 2),
+        segment=cfg["segment"],
+        product=cfg["product"],
+        exchange=cfg["exchange"]
+    )
+
+    if order:
+        fill      = order_feed.wait_for_fill(order["order_id"], timeout=30)
+        avg_price = fill.get("average_price", ltp)
+
+        if fill.get("order_status") == "FAILED":
+            notifier.order_failed(
+                "BUY", cfg["name"], qty,
+                fill.get("reason", "Unknown")
+            )
             return
 
-        order = api.place_order(
-            txn_type="BUY",
-            security_id=SECURITY_ID,
+        posmgr.open_position(
+            scrip_code=cfg["scrip_code"],
+            name=cfg["name"],
+            segment=cfg["segment"],
             qty=qty,
-            order_type="LIMIT",
-            limit_price=round(ltp * 1.001, 2)  # 0.1% above LTP
+            entry_price=avg_price,
+            order_id=order["order_id"],
+            signal_meta=result
         )
-        if order:
-            position = {"order_id": order["order_id"], "qty": qty, "entry": ltp}
-            logger.info(f"✅ BUY | qty={qty} @ ₹{ltp}")
+        notifier.trade_executed(
+            side="BUY",
+            name=cfg["name"],
+            segment=cfg["segment"],
+            qty=qty,
+            price=avg_price,
+            confidence=result["confidence"],
+            xgb=result["xgb"],
+            rl=result["rl"]
+        )
 
-    elif signal == "SELL" and position is not None:
-        order = api.place_order(
-            txn_type="SELL",
-            security_id=SECURITY_ID,
-            qty=position["qty"],
-            order_type="MARKET"
+# ── Exit ──────────────────────────────────────────────────────
+
+def process_exit(cfg: dict, ltp: float):
+    pos = posmgr.positions.get(cfg["scrip_code"])
+    if not pos:
+        return
+
+    order = api.place_order(
+        txn_type="SELL",
+        security_id=cfg["security_id"],
+        qty=pos["qty"],
+        order_type="MARKET",
+        segment=cfg["segment"],
+        product=cfg["product"],
+        exchange=cfg["exchange"]
+    )
+
+    if order:
+        fill       = order_feed.wait_for_fill(order["order_id"], timeout=30)
+        exit_price = fill.get("average_price", ltp)
+        closed     = posmgr.close_position(cfg["scrip_code"], exit_price)
+        pnl        = closed.get("pnl", 0)
+        risk.update_pnl(pnl)
+
+        notifier.trade_closed(
+            name=cfg["name"],
+            qty=pos["qty"],
+            entry=pos["entry"],
+            exit_price=exit_price,
+            pnl=pnl,
+            daily_pnl=risk.daily_pnl
         )
-        if order:
-            pnl = (ltp - position["entry"]) * position["qty"]
-            risk.update_pnl(pnl)
-            logger.info(f"✅ SELL | PnL: ₹{pnl:.2f}")
-            position = None
+
+# ── Scheduled jobs ────────────────────────────────────────────
 
 def square_off_all():
-    """Force close all positions at 3:15 PM"""
-    global position
-    if position:
-        logger.info("⏰ Auto square-off triggered")
-        api.place_order("SELL", SECURITY_ID, position["qty"], order_type="MARKET")
-        position = None
+    logger.info("⏰ Auto square-off triggered")
+    notifier.squareoff_alert(posmgr.positions)
+    for scrip_code, pos in list(posmgr.positions.items()):
+        cfg = next(
+            (s for s in scanner.universe_equity + scanner.universe_fno
+             if s["scrip_code"] == scrip_code),
+            None
+        )
+        if cfg:
+            ltp = price_feed.get_ltp(
+                cfg["ws_token"].split(":")[1]
+            ) or pos["entry"]
+            process_exit(cfg, ltp)
 
 def daily_reset():
     risk.reset_daily()
     logger.info("🔄 Daily counters reset")
 
-# ── Scheduler ────────────────────────────────────────────────
-schedule.every(CHECK_EVERY).seconds.do(run_cycle)
-schedule.every().day.at("09:14").do(daily_reset)
-schedule.every().day.at("15:15").do(square_off_all)
+def send_daily_summary():
+    status  = posmgr.status()
+    balance = get_balance("EQUITY") + get_balance("DERIVATIVE")
+    notifier.daily_summary(
+        total_pnl=risk.daily_pnl,
+        trades=risk.trades_today,
+        wins=status["win_count"],
+        balance=balance
+    )
+
+def refresh_ws_subscriptions():
+    """
+    After each Tier 1 scan the shortlist changes.
+    Update WebSocket subscriptions to match new shortlist.
+    """
+    new_tokens = scanner.get_ws_tokens()
+    if price_feed.ws:
+        try:
+            import json
+            price_feed.ws.send(json.dumps({
+                "action":      "subscribe",
+                "mode":        "ltp",
+                "instruments": new_tokens
+            }))
+            logger.info(f"🔄 WebSocket updated: {len(new_tokens)} instruments")
+        except Exception as e:
+            logger.error(f"WS subscription update error: {e}")
+
+# ── Boot ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logger.info("🚀 Bot started")
+    logger.info("🚀 Booting algo bot — Full Market Mode...")
+
+    # Step 1: Load full instrument universe from API
+    # Downloads equity + FNO + index CSVs
+    scanner.load_universe()
+
+    # Step 2: Run first Tier 1 scan
+    # Scores all instruments, shortlists top 50 equity + 10 FNO
+    scanner.tier1_scan()
+
+    # Step 3: Start WebSocket with shortlisted tokens
+    price_feed.instruments = scanner.get_ws_tokens()
+    price_feed.start()
+    order_feed.start()
+    time.sleep(2)
+
+    # Step 4: Start background Tier 1 refresh every 30 min
+    scanner.start_background_refresh()
+
+    # Step 5: Start Telegram command listener
+    notifier.start_command_listener(bot_ref=sys.modules[__name__])
+
+    # Step 6: Schedule all jobs
+    schedule.every(60).seconds.do(run_cycle)
+    schedule.every(30).minutes.do(refresh_ws_subscriptions)
+    schedule.every().day.at("09:14").do(daily_reset)
+    schedule.every().day.at(SQUAREOFF_AT).do(square_off_all)
+    schedule.every().day.at("15:30").do(send_daily_summary)
+    # Reload full universe CSV daily at midnight
+    schedule.every().day.at("00:01").do(scanner.load_universe)
+
+    # Step 7: Send startup alert
+    notifier.bot_started()
+
+    logger.info("✅ All systems running — scanning full NSE market")
+
+    # Step 8: Main loop
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            notifier.bot_stopped("Manual shutdown")
+            price_feed.stop()
+            order_feed.stop()
+            notifier.stop_listener()
+            break
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+            notifier.error("MainLoopError", str(e))
+            time.sleep(5)
+```
+
+---
+
+## What Changed vs Your Old `bot.py`
+
+| Old | New |
+|---|---|
+| 2 hardcoded instruments | Full NSE market (~1,800 equity + ~200 FNO) |
+| No signal ranking | Ranked by confidence, strongest trades first |
+| Fixed positions dict | `PositionManager` with dynamic slots |
+| No Telegram | Full alert system wired in |
+| Static WebSocket tokens | Dynamic, updates every 30 min with new movers |
+| 2 fixed ML trainers | Lazy trainers created per instrument as needed |
+| No kill switch alerts | Risk warnings + kill switch notifications |
+| Basic square off | Smart square off using live universe |
+| No daily summary | Sent at 15:30 every day to Telegram |
+| No graceful shutdown | Clean shutdown on Ctrl+C or Railway stop |
+
+---
+
+## Complete Final File List for GitHub
+```
+indstocks_bot/
+├── .env                  ← INDSTOCKS_TOKEN, TELEGRAM tokens
+├── requirements.txt
+├── config.py
+├── api.py
+├── risk.py
+├── websocket_feed.py
+├── notifier.py
+├── watchlist.py          ← Full market scanner
+├── position_manager.py   ← Smart position slots
+├── bot.py                ← This file ✅
+└── ml/
+    ├── __init__.py
+    ├── features.py
+    ├── model.py
+    └── trainer.py

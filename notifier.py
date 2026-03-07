@@ -1,9 +1,8 @@
 import requests
 import logging
-import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
@@ -18,15 +17,19 @@ class TelegramNotifier:
     BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
     def __init__(self):
-        self.chat_id       = TELEGRAM_CHAT_ID
-        self.bot_paused    = False   # Controlled via /stop and /resume
-        self._last_update  = 0       # For command polling
-        self._command_callbacks = {} # Registered command handlers
-        self._running      = False
+        self.chat_id      = TELEGRAM_CHAT_ID
+        self.bot_paused   = False
+        self._last_update = 0
+        self._running     = False
+        self._bot_ref     = None
 
     # ─────────────────────────────────────────────────────────
     # CORE SEND
     # ─────────────────────────────────────────────────────────
+
+    def send(self, message: str):
+        """Public alias used by command handlers."""
+        self._send(message)
 
     def _send(self, message: str):
         """Send message in background thread so bot never blocks."""
@@ -37,7 +40,7 @@ class TelegramNotifier:
                     json={
                         "chat_id":    self.chat_id,
                         "text":       message,
-                        "parse_mode": "HTML"   # Supports <b>, <i>, <code>
+                        "parse_mode": "HTML"
                     },
                     timeout=10
                 )
@@ -59,12 +62,21 @@ class TelegramNotifier:
             f"Time    : {self._now()}\n"
             "Status  : All systems running\n"
             "Mode    : Live trading\n\n"
-            "Commands:\n"
-            "/status   → current positions\n"
-            "/stop     → pause trading\n"
-            "/resume   → resume trading\n"
-            "/pnl      → today's PnL\n"
-            "/positions → open positions"
+            "<b>📊 Info</b>\n"
+            "/status    → system health\n"
+            "/risk      → risk limits &amp; usage\n"
+            "/pnl       → today's PnL\n"
+            "/positions → open positions\n\n"
+            "<b>⚙️ Controls</b>\n"
+            "/stop      → pause trading\n"
+            "/resume    → resume trading\n"
+            "/pause 30  → pause for 30 mins\n\n"
+            "<b>💰 Risk Controls</b>\n"
+            "/setlimit 5000  → max ₹ per trade\n"
+            "/setdaily 3000  → max daily loss ₹\n"
+            "/setslots 3 2   → equity/FNO slots\n"
+            "/settrades 10   → max trades/day\n\n"
+            "Send /help anytime for full list"
         )
 
     def bot_stopped(self, reason: str = "Manual shutdown"):
@@ -95,8 +107,8 @@ class TelegramNotifier:
     def trade_closed(self, name: str, qty: int,
                      entry: float, exit_price: float,
                      pnl: float, daily_pnl: float):
-        emoji  = "✅" if pnl >= 0 else "❌"
-        pct    = ((exit_price - entry) / entry) * 100
+        emoji = "✅" if pnl >= 0 else "❌"
+        pct   = ((exit_price - entry) / entry) * 100
         self._send(
             f"{emoji} <b>POSITION CLOSED</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -135,7 +147,7 @@ class TelegramNotifier:
 
     def risk_warning(self, daily_pnl: float,
                      limit: float, balance: float):
-        pct = (abs(daily_pnl) / balance) * 100
+        pct = (abs(daily_pnl) / balance) * 100 if balance else 0
         self._send(
             "⚠️ <b>RISK WARNING</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -160,7 +172,10 @@ class TelegramNotifier:
         lines = ""
         for key, pos in positions.items():
             if pos:
-                lines += f"  {key.upper()} — {pos['qty']} units @ ₹{pos['entry']:,.2f}\n"
+                lines += (
+                    f"  {key.upper()} — "
+                    f"{pos['qty']} units @ ₹{pos['entry']:,.2f}\n"
+                )
         if not lines:
             lines = "  No open positions\n"
         self._send(
@@ -188,9 +203,9 @@ class TelegramNotifier:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Action  : Trading paused\n"
             f"Time    : {self._now()}\n\n"
-            "Go to indstocks.com → API section\n"
-            "→ Regenerate token\n"
-            "→ Update INDSTOCKS_TOKEN in Railway variables"
+            "1️⃣ INDstocks → Algo Access → New Token\n"
+            "2️⃣ Render → Environment → Update INDSTOCKS_TOKEN\n"
+            "3️⃣ Render auto-redeploys in ~60s"
         )
 
     def daily_summary(self, total_pnl: float, trades: int,
@@ -219,15 +234,11 @@ class TelegramNotifier:
         )
 
     # ─────────────────────────────────────────────────────────
-    # TWO-WAY COMMAND CONTROL
+    # COMMAND LISTENER
     # ─────────────────────────────────────────────────────────
 
-    def start_command_listener(self, bot_ref):
-        """
-        Polls Telegram every 3 seconds for incoming commands.
-        bot_ref = the running bot object so commands can control it.
-        Runs in background thread.
-        """
+    def start_command_listener(self, bot_ref=None):
+        self._bot_ref = bot_ref
         self._running = True
 
         def _poll():
@@ -245,22 +256,129 @@ class TelegramNotifier:
                         updates = response.json().get("result", [])
                         for update in updates:
                             self._last_update = update["update_id"]
-                            msg = update.get("message", {})
-                            text = msg.get("text", "").strip().lower()
-                            self._handle_command(text, bot_ref)
+                            msg  = update.get("message", {})
+                            text = msg.get("text", "").strip()
+                            if text:
+                                self._handle_command(text)
                 except Exception as e:
                     logger.error(f"Command poll error: {e}")
                 time.sleep(3)
 
-        thread = threading.Thread(target=_poll, daemon=True)
-        thread.start()
+        threading.Thread(target=_poll, daemon=True).start()
         logger.info("✅ Telegram command listener started")
-        return thread
 
-    def _handle_command(self, command: str, bot_ref):
+    def _handle_command(self, text: str):
         """Route incoming Telegram commands to bot actions."""
+        parts = text.strip().split()
+        cmd   = parts[0].lower() if parts else ""
+        args  = parts[1:]
+        ref   = self._bot_ref
 
-        if command == "/stop":
+        # ── /help ─────────────────────────────────────────
+        if cmd == "/help":
+            self._send(
+                "ℹ️ <b>AVAILABLE COMMANDS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<b>📊 Info</b>\n"
+                "/status      → system health\n"
+                "/risk        → risk dashboard\n"
+                "/pnl         → today's PnL\n"
+                "/positions   → open positions\n\n"
+                "<b>⚙️ Controls</b>\n"
+                "/stop            → pause all trading\n"
+                "/resume          → resume trading\n"
+                "/pause 30        → pause for N minutes\n\n"
+                "<b>💰 Risk Controls</b>\n"
+                "/setlimit 5000   → max ₹ per trade\n"
+                "/setlimit 0      → remove trade limit\n"
+                "/setdaily 3000   → max daily loss ₹\n"
+                "/setdaily 0      → revert to 3% auto\n"
+                "/setslots 3 2    → equity / FNO slots\n"
+                "/settrades 10    → max trades today"
+            )
+
+        # ── /status ───────────────────────────────────────
+        elif cmd == "/status":
+            if not ref:
+                return
+            st = ref.posmgr.status()
+            self._send(
+                "📊 <b>BOT STATUS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Mode      : {'⏸ Paused' if self.bot_paused else '✅ Live'}\n"
+                f"Positions : {st['open_positions']} open\n"
+                f"Equity    : {st['equity_open']}/{ref.MAX_EQUITY_POS} slots\n"
+                f"FNO       : {st['fno_open']}/{ref.MAX_FNO_POS} slots\n"
+                f"Win Rate  : {st['win_rate']:.1f}%\n"
+                f"Daily PnL : ₹{ref.risk.daily_pnl:+,.0f}\n"
+                f"Trades    : {ref.risk.trades_today}/{ref.risk.max_trades_per_day}\n"
+                f"Time      : {self._now()}"
+            )
+
+        # ── /risk ─────────────────────────────────────────
+        elif cmd == "/risk":
+            if not ref:
+                return
+            bal   = ref.get_balance("EQUITY")
+            limit = ref.risk.get_daily_limit(bal)
+            used  = abs(min(ref.risk.daily_pnl, 0))
+            pct   = (used / limit * 100) if limit else 0
+            st    = ref.posmgr.status()
+            pt    = ref.risk.per_trade_limit
+            dc    = ref.risk.daily_loss_cap
+            self._send(
+                "💰 <b>RISK DASHBOARD</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Daily Loss Limit : ₹{limit:,.0f}"
+                f" {'(custom)' if dc else '(3% auto)'}\n"
+                f"Daily Loss Used  : ₹{used:,.0f} ({pct:.0f}%)\n"
+                f"Per Trade Limit  : "
+                f"{'₹' + f'{pt:,.0f}' if pt else 'No limit set'}\n"
+                f"Max Trades/Day   : {ref.risk.max_trades_per_day}\n"
+                f"Trades Today     : {ref.risk.trades_today}\n"
+                f"Balance          : ₹{bal:,.0f}\n\n"
+                f"<b>Positions</b>\n"
+                f"Equity : {st['equity_open']}/{ref.MAX_EQUITY_POS} slots used\n"
+                f"FNO    : {st['fno_open']}/{ref.MAX_FNO_POS} slots used\n\n"
+                f"Status : {'⏸ Paused' if self.bot_paused else '✅ Active'}"
+            )
+
+        # ── /pnl ──────────────────────────────────────────
+        elif cmd == "/pnl":
+            if not ref:
+                return
+            emoji = "✅" if ref.risk.daily_pnl >= 0 else "❌"
+            bal   = ref.get_balance("EQUITY")
+            self._send(
+                f"{emoji} <b>TODAY'S PnL</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Daily PnL  : ₹{ref.risk.daily_pnl:+,.2f}\n"
+                f"Trades     : {ref.risk.trades_today}\n"
+                f"Balance    : ₹{bal:,.0f}\n"
+                f"Time       : {self._now()}"
+            )
+
+        # ── /positions ────────────────────────────────────
+        elif cmd == "/positions":
+            if not ref:
+                return
+            positions = ref.posmgr.positions
+            if not positions:
+                self._send("📭 No open positions")
+                return
+            lines = ["📋 <b>OPEN POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━━"]
+            for sc, pos in positions.items():
+                lines.append(
+                    f"<b>{pos['name']}</b>\n"
+                    f"  Qty     : {pos['qty']}\n"
+                    f"  Entry   : ₹{pos['entry']:,.2f}\n"
+                    f"  Segment : {pos['segment']}"
+                )
+            lines.append(f"Time : {self._now()}")
+            self._send("\n\n".join(lines))
+
+        # ── /stop ─────────────────────────────────────────
+        elif cmd == "/stop":
             self.bot_paused = True
             self._send(
                 "⛔ <b>TRADING PAUSED</b>\n"
@@ -270,7 +388,8 @@ class TelegramNotifier:
                 "Send /resume to restart."
             )
 
-        elif command == "/resume":
+        # ── /resume ───────────────────────────────────────
+        elif cmd == "/resume":
             self.bot_paused = False
             self._send(
                 "✅ <b>TRADING RESUMED</b>\n"
@@ -279,64 +398,140 @@ class TelegramNotifier:
                 f"Time : {self._now()}"
             )
 
-        elif command == "/status":
-            positions = bot_ref.positions if hasattr(bot_ref, "positions") else {}
-            risk      = bot_ref.risk      if hasattr(bot_ref, "risk")      else None
-            lines = ""
-            for key, pos in positions.items():
-                if pos:
-                    lines += (f"  {key.upper()}: {pos['qty']} units "
-                              f"@ ₹{pos['entry']:,.2f}\n")
-            if not lines:
-                lines = "  No open positions\n"
-            pnl_line = f"₹{risk.daily_pnl:+,.2f}" if risk else "N/A"
+        # ── /pause <minutes> ──────────────────────────────
+        elif cmd == "/pause":
+            minutes = int(args[0]) if args and args[0].isdigit() else 30
+            self.bot_paused = True
+            resume_at = datetime.now() + timedelta(minutes=minutes)
             self._send(
-                "📊 <b>BOT STATUS</b>\n"
+                "⏸ <b>BOT PAUSED</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"Running    : {'⛔ PAUSED' if self.bot_paused else '✅ ACTIVE'}\n"
-                f"Daily PnL  : {pnl_line}\n"
-                f"Positions  :\n{lines}"
-                f"Time       : {self._now()}"
+                f"Duration  : {minutes} minutes\n"
+                f"Resumes   : {resume_at.strftime('%I:%M %p')}\n"
+                f"Time      : {self._now()}"
             )
-
-        elif command == "/positions":
-            positions = bot_ref.positions if hasattr(bot_ref, "positions") else {}
-            lines = ""
-            for key, pos in positions.items():
-                if pos:
-                    lines += (f"  {key.upper()}: {pos['qty']} units "
-                              f"@ ₹{pos['entry']:,.2f}\n")
-            if not lines:
-                lines = "  No open positions\n"
-            self._send(
-                "📋 <b>OPEN POSITIONS</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"{lines}"
-                f"Time : {self._now()}"
-            )
-
-        elif command == "/pnl":
-            risk = bot_ref.risk if hasattr(bot_ref, "risk") else None
-            if risk:
-                emoji = "✅" if risk.daily_pnl >= 0 else "❌"
+            def _auto_resume():
+                time.sleep(minutes * 60)
+                self.bot_paused = False
                 self._send(
-                    f"{emoji} <b>TODAY'S PnL</b>\n"
+                    "▶️ <b>BOT AUTO-RESUMED</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Daily PnL  : ₹{risk.daily_pnl:+,.2f}\n"
-                    f"Trades     : {risk.trades_today}\n"
-                    f"Time       : {self._now()}"
+                    "Pause period ended.\n"
+                    f"Time : {self._now()}"
+                )
+            threading.Thread(target=_auto_resume, daemon=True).start()
+
+        # ── /setlimit <amount> ────────────────────────────
+        elif cmd == "/setlimit":
+            if not args:
+                self._send(
+                    "Usage: <code>/setlimit 5000</code>\n"
+                    "Sets max ₹ value for any single trade.\n"
+                    "Use <code>/setlimit 0</code> to remove the limit."
+                )
+                return
+            try:
+                amount = float(args[0])
+                if amount <= 0:
+                    ref.risk.per_trade_limit = None
+                    self._send(
+                        "✅ Per-trade limit <b>removed</b>\n"
+                        "Using default position sizing."
+                    )
+                else:
+                    ref.risk.per_trade_limit = amount
+                    self._send(
+                        "✅ <b>Per-trade limit set</b>\n"
+                        f"Max spend per trade : ₹{amount:,.0f}\n"
+                        "Takes effect on next cycle."
+                    )
+            except (ValueError, AttributeError):
+                self._send(
+                    "❌ Invalid amount.\n"
+                    "Usage: <code>/setlimit 5000</code>"
                 )
 
-        elif command == "/help":
+        # ── /setdaily <amount> ────────────────────────────
+        elif cmd == "/setdaily":
+            if not args:
+                self._send(
+                    "Usage: <code>/setdaily 3000</code>\n"
+                    "Sets max ₹ daily loss before bot stops.\n"
+                    "Use <code>/setdaily 0</code> to revert to 3% of balance."
+                )
+                return
+            try:
+                amount = float(args[0])
+                if amount <= 0:
+                    ref.risk.daily_loss_cap = None
+                    self._send(
+                        "✅ Daily loss cap <b>removed</b>\n"
+                        "Reverting to 3% of balance."
+                    )
+                else:
+                    ref.risk.daily_loss_cap = amount
+                    self._send(
+                        "✅ <b>Daily loss cap set</b>\n"
+                        f"Bot stops if loss hits : ₹{amount:,.0f}\n"
+                        "Takes effect immediately."
+                    )
+            except (ValueError, AttributeError):
+                self._send(
+                    "❌ Invalid amount.\n"
+                    "Usage: <code>/setdaily 3000</code>"
+                )
+
+        # ── /setslots <equity> <fno> ──────────────────────
+        elif cmd == "/setslots":
+            if len(args) < 2:
+                self._send(
+                    "Usage: <code>/setslots 3 2</code>\n"
+                    "Sets max open positions for equity and FNO."
+                )
+                return
+            try:
+                eq  = int(args[0])
+                fno = int(args[1])
+                ref.posmgr.max_equity = eq
+                ref.posmgr.max_fno    = fno
+                ref.MAX_EQUITY_POS    = eq
+                ref.MAX_FNO_POS       = fno
+                self._send(
+                    "✅ <b>Position slots updated</b>\n"
+                    f"Equity : max {eq} open positions\n"
+                    f"FNO    : max {fno} open positions"
+                )
+            except (ValueError, AttributeError):
+                self._send(
+                    "❌ Invalid.\n"
+                    "Usage: <code>/setslots 3 2</code>"
+                )
+
+        # ── /settrades <n> ────────────────────────────────
+        elif cmd == "/settrades":
+            if not args:
+                self._send(
+                    "Usage: <code>/settrades 10</code>\n"
+                    "Sets max trades allowed today."
+                )
+                return
+            try:
+                n = int(args[0])
+                ref.risk.max_trades_per_day = n
+                self._send(
+                    f"✅ <b>Max trades/day set to {n}</b>\n"
+                    f"Used so far today : {ref.risk.trades_today}"
+                )
+            except (ValueError, AttributeError):
+                self._send(
+                    "❌ Invalid.\n"
+                    "Usage: <code>/settrades 10</code>"
+                )
+
+        elif cmd.startswith("/"):
             self._send(
-                "ℹ️ <b>AVAILABLE COMMANDS</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "/status    → bot status + positions\n"
-                "/positions → open positions\n"
-                "/pnl       → today's PnL\n"
-                "/stop      → pause all trading\n"
-                "/resume    → resume trading\n"
-                "/help      → show this message"
+                f"❓ Unknown command: <code>{cmd}</code>\n"
+                "Send /help to see all commands."
             )
 
     def stop_listener(self):

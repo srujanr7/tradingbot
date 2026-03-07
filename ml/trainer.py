@@ -3,7 +3,7 @@ import time
 import schedule
 import threading
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from api import INDstocksAPI
 from ml.features import build_features, build_labels
 from ml.model import XGBSignalModel, RLAgent
@@ -13,133 +13,247 @@ logger = logging.getLogger(__name__)
 
 class AutoTrainer:
     """
-    Fetches fresh historical data and retrains both
-    XGBoost and PPO models on a schedule.
-    Runs in a background thread — never blocks the live bot.
+    Fetches fresh historical data and retrains
+    XGBoost model on a schedule.
+    RL model trained only if libraries available.
+    Runs in background thread — never blocks live bot.
     """
+
     def __init__(self, scrip_code: str, security_id: str,
                  interval: str = "15minute",
                  retrain_days: int = 90):
-        self.api         = INDstocksAPI()
-        self.scrip_code  = scrip_code
-        self.security_id = security_id
-        self.interval    = interval
+        self.api          = INDstocksAPI()
+        self.scrip_code   = scrip_code
+        self.security_id  = security_id
+        self.interval     = interval
         self.retrain_days = retrain_days
 
-        self.xgb = XGBSignalModel()
-        self.rl  = RLAgent()
+        self.xgb = XGBSignalModel(
+            model_path=f"ml/xgb_{scrip_code}.pkl"
+        )
+        self.rl = RLAgent(
+            model_path=f"ml/ppo_{scrip_code}"
+        )
 
         # Try loading existing models first
         self.xgb.load()
         self.rl.load()
 
-        self._lock = threading.Lock()   # Thread-safe model swaps
+        self._lock = threading.Lock()
+
+    # ── Data fetching ─────────────────────────────────────────
 
     def _fetch_training_data(self) -> pd.DataFrame:
-        """Fetch last N days of candles in chunks (API max: 7 days per call)"""
+        """
+        Fetch last N days of candles in chunks.
+        INDstocks API max is 7 days per call so we chunk it.
+        """
         all_candles = []
-        end_ms   = int(time.time() * 1000)
-        chunk_ms = 6 * 24 * 60 * 60 * 1000    # 6-day chunks
-        total_ms = self.retrain_days * 24 * 60 * 60 * 1000
-        start_ms = end_ms - total_ms
+        end_ms      = int(time.time() * 1000)
+        chunk_ms    = 6 * 24 * 60 * 60 * 1000
+        total_ms    = self.retrain_days * 24 * 60 * 60 * 1000
+        start_ms    = end_ms - total_ms
+        current     = start_ms
 
-        current_start = start_ms
-        while current_start < end_ms:
-            current_end = min(current_start + chunk_ms, end_ms)
-            df_chunk = self.api.get_historical(
-                self.scrip_code, self.interval,
-                current_start, current_end
+        while current < end_ms:
+            chunk_end = min(current + chunk_ms, end_ms)
+            df_chunk  = self.api.get_historical(
+                self.scrip_code,
+                self.interval,
+                current,
+                chunk_end
             )
             if df_chunk is not None and len(df_chunk) > 0:
                 all_candles.append(df_chunk)
-            current_start = current_end
-            time.sleep(0.5)   # Respect rate limits
+            current = chunk_end
+            time.sleep(0.5)
 
         if not all_candles:
+            logger.warning(
+                f"No training data for {self.scrip_code}"
+            )
             return None
 
         df = pd.concat(all_candles).drop_duplicates("timestamp")
         df = df.sort_values("timestamp").reset_index(drop=True)
-        logger.info(f"Fetched {len(df)} candles for training")
+        logger.info(
+            f"Fetched {len(df)} candles for {self.scrip_code}"
+        )
         return df
 
+    # ── Retraining ────────────────────────────────────────────
+
     def retrain(self):
-        logger.info(f"🔄 Retraining started at {datetime.now()}")
+        start_time = time.time()
+        logger.info(
+            f"Retraining started for {self.scrip_code} "
+            f"at {datetime.now()}"
+        )
+
         df = self._fetch_training_data()
         if df is None or len(df) < 200:
-            logger.warning("Not enough data to retrain. Skipping.")
+            logger.warning(
+                f"Not enough data for {self.scrip_code}. "
+                f"Skipping retrain."
+            )
             return
 
         features = build_features(df)
         labels   = build_labels(df, horizon=3, threshold=0.005)
 
-        # ── Retrain XGBoost ───────────────────────────────────
-        new_xgb = XGBSignalModel()
-        new_xgb.train(features, labels)
+        if features.empty:
+            logger.warning(
+                f"Empty features for {self.scrip_code}. Skipping."
+            )
+            return
 
-        # ── Retrain RL ────────────────────────────────────────
-        aligned = features.copy()
-        aligned["close"] = df["close"].loc[features.index]
-        new_rl = RLAgent()
-        new_rl.train(
-            aligned.drop(columns=["close"]),
-            aligned["close"],
-            timesteps=300_000
+        # ── Retrain XGBoost ───────────────────────────────────
+        new_xgb = XGBSignalModel(
+            model_path=f"ml/xgb_{self.scrip_code}.pkl"
         )
+        try:
+            new_xgb.train(features, labels)
+        except Exception as e:
+            logger.error(f"XGB training failed: {e}")
+            return
+
+        # ── Retrain RL (only if available) ────────────────────
+        new_rl = RLAgent(
+            model_path=f"ml/ppo_{self.scrip_code}"
+        )
+        if new_rl.available:
+            try:
+                aligned          = features.copy()
+                aligned["close"] = df["close"].loc[features.index]
+                new_rl.train(
+                    aligned.drop(columns=["close"]),
+                    aligned["close"],
+                    timesteps=300_000
+                )
+                logger.info(
+                    f"RL retrain complete for {self.scrip_code}"
+                )
+            except Exception as e:
+                logger.error(f"RL training failed: {e}")
+                new_rl = self.rl  # Keep old model on failure
+        else:
+            new_rl = self.rl
+            logger.info(
+                "Skipping RL retrain — using XGBoost only"
+            )
 
         # ── Atomic model swap ─────────────────────────────────
         with self._lock:
             self.xgb = new_xgb
             self.rl  = new_rl
 
-        logger.info("✅ Models retrained and swapped live")
+        duration = time.time() - start_time
+        logger.info(
+            f"Retrain complete for {self.scrip_code} "
+            f"in {duration:.0f}s"
+        )
+
+        # Send Telegram notification
+        try:
+            from notifier import TelegramNotifier
+            notifier = TelegramNotifier()
+            notifier.model_retrained(
+                instrument=self.scrip_code,
+                samples=len(features),
+                duration_seconds=duration,
+                next_retrain="Next Sunday 18:30"
+            )
+        except Exception:
+            pass
+
+    # ── Signal generation ─────────────────────────────────────
 
     def get_signal(self, df: pd.DataFrame) -> dict:
         """
         Combine XGBoost + RL votes into final signal.
-        Called by the live bot on every cycle.
+        Called by live bot on every cycle.
+        If RL not available, XGBoost carries full weight.
         """
         with self._lock:
+            if df is None or len(df) < 50:
+                return {
+                    "signal":     "HOLD",
+                    "confidence": 0.0,
+                    "xgb":        "HOLD",
+                    "rl":         "HOLD",
+                    "votes":      {"BUY": 0, "SELL": 0, "HOLD": 1}
+                }
+
             features = build_features(df)
             if features.empty:
-                return {"signal": "HOLD", "confidence": 0.0, "source": "none"}
+                return {
+                    "signal":     "HOLD",
+                    "confidence": 0.0,
+                    "xgb":        "HOLD",
+                    "rl":         "HOLD",
+                    "votes":      {"BUY": 0, "SELL": 0, "HOLD": 1}
+                }
 
-            # XGBoost vote
+            # XGBoost prediction
             xgb_result = self.xgb.predict(features)
+            xgb_signal = xgb_result["signal"]
+            xgb_conf   = xgb_result["confidence"]
 
-            # RL vote
-            obs = features.iloc[-1].values
-            import numpy as np
-            rl_action = self.rl.predict(
-                np.append(obs, [0.0, 0.0]).astype(np.float32)
-            )
-            rl_signal = {0: "HOLD", 1: "BUY", 2: "SELL"}.get(rl_action, "HOLD")
+            # RL prediction
+            try:
+                obs = features.iloc[-1].values
+                rl_action = self.rl.predict(
+                    np.append(obs, [0.0, 0.0]).astype(np.float32)
+                    if self.rl.available else obs
+                )
+                rl_signal = {
+                    0: "HOLD",
+                    1: "BUY",
+                    2: "SELL"
+                }.get(rl_action, "HOLD")
+            except Exception:
+                rl_signal = "HOLD"
 
-            # Weighted consensus: XGB 60%, RL 40%
+            # Weighted vote
+            # If RL available: XGB=60%, RL=40%
+            # If RL not available: XGB=100%
             votes = {"BUY": 0.0, "SELL": 0.0, "HOLD": 0.0}
-            votes[xgb_result["signal"]] += 0.6 * xgb_result["confidence"]
-            votes[rl_signal] += 0.4
+
+            if self.rl.available and self.rl.model is not None:
+                votes[xgb_signal] += 0.6 * xgb_conf
+                votes[rl_signal]  += 0.4
+            else:
+                votes[xgb_signal] += xgb_conf
 
             final = max(votes, key=votes.get)
+
             return {
                 "signal":     final,
                 "confidence": votes[final],
-                "xgb":        xgb_result["signal"],
+                "xgb":        xgb_signal,
                 "rl":         rl_signal,
                 "votes":      votes
             }
 
+    # ── Scheduling ────────────────────────────────────────────
+
     def start_schedule(self, retrain_time: str = "18:30"):
         """
         Schedule weekly retraining after market close.
+        Also triggers immediate training if no model exists.
         Runs in background thread.
         """
         schedule.every().sunday.at(retrain_time).do(self.retrain)
 
-        # Also retrain immediately on first startup if no model exists
         if not self.xgb.is_trained:
-            logger.info("No model found. Running initial training...")
-            threading.Thread(target=self.retrain, daemon=True).start()
+            logger.info(
+                f"No model for {self.scrip_code}. "
+                f"Running initial training..."
+            )
+            threading.Thread(
+                target=self.retrain,
+                daemon=True
+            ).start()
 
         def _loop():
             while True:
@@ -148,5 +262,12 @@ class AutoTrainer:
 
         thread = threading.Thread(target=_loop, daemon=True)
         thread.start()
-        logger.info(f"✅ Auto-trainer scheduled every Sunday at {retrain_time}")
+        logger.info(
+            f"Auto-trainer scheduled for {self.scrip_code} "
+            f"every Sunday at {retrain_time}"
+        )
         return thread
+
+
+# Fix missing numpy import in get_signal
+import numpy as np

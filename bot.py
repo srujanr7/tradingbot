@@ -22,16 +22,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-
-# ── Log outbound IP on boot so you can register it on INDstocks
+# ── Log outbound IP ───────────────────────────────────────────
 import requests as _req
 try:
     _ip = _req.get("https://api.ipify.org", timeout=5).text
     logger.info(f"🌐 Outbound IP: {_ip}")
 except Exception:
     logger.warning("Could not detect outbound IP")
-# ─────────────────────────────────────────────────────────────
 
 # ── Config ────────────────────────────────────────────────────
 INTERVAL       = "15minute"
@@ -41,6 +38,10 @@ SQUAREOFF_AT   = "15:10"
 MAX_EQUITY_POS = 3
 MAX_FNO_POS    = 2
 MIN_CONFIDENCE = 0.70
+
+# ── Trading Mode — controlled via Telegram ────────────────────
+TRADE_MODE    = "MIS"   # "MIS" = intraday, "CNC" = delivery
+TRADE_CAPITAL = None    # None = use all available, or ₹ amount via /setcapital
 # ─────────────────────────────────────────────────────────────
 
 api      = INDstocksAPI()
@@ -63,7 +64,6 @@ trainers      = {}
 _trainer_lock = threading.Lock()
 
 def get_trainer(cfg: dict) -> AutoTrainer:
-    """Get or create ML trainer for an instrument. Thread-safe."""
     key = cfg["scrip_code"]
     if key not in trainers:
         with _trainer_lock:
@@ -85,11 +85,10 @@ def refresh_token():
     notifier.send(
         "🔑 <b>Action Required: Daily Token Refresh</b>\n\n"
         "INDstocks token expired at 6AM.\n\n"
-        "1️⃣ Open INDstocks → Algo Access → New Token\n"
-        "2️⃣ Copy the new token\n"
-        "3️⃣ Open Render → tradingbot → Environment\n"
-        "4️⃣ Update <code>INDSTOCKS_TOKEN</code> → Save Changes\n"
-        "5️⃣ Render redeploys automatically in ~60 sec\n\n"
+        "1️⃣ SSH into your Google Cloud VM\n"
+        "2️⃣ Run: <code>cd tradingbot && ./update_token.sh</code>\n"
+        "3️⃣ Paste your new INDstocks token when prompted\n"
+        "4️⃣ Bot restarts automatically\n\n"
         "⏰ Complete before 9:15AM market open"
     )
     logger.info("🔑 Token refresh alert sent via Telegram.")
@@ -129,7 +128,20 @@ def get_balance(segment: str) -> float:
     if not funds:
         return 0.0
     avl = funds.get("detailed_avl_balance", {})
-    return avl.get("eq_cnc" if segment == "EQUITY" else "future", 0.0)
+
+    if segment == "EQUITY":
+        # Use MIS or CNC based on TRADE_MODE
+        if TRADE_MODE == "MIS":
+            raw = avl.get("eq_mis", 0.0)
+        else:
+            raw = avl.get("eq_cnc", 0.0)
+    else:
+        raw = avl.get("future", 0.0)
+
+    # Cap to TRADE_CAPITAL if set via /setcapital
+    if TRADE_CAPITAL is not None:
+        return min(raw, TRADE_CAPITAL)
+    return raw
 
 # ── Core cycle ────────────────────────────────────────────────
 
@@ -142,10 +154,7 @@ def run_cycle():
         return
 
     if not api.is_token_valid():
-        logger.warning(
-            "⚠️ Token invalid — skipping cycle. "
-            "Update INDSTOCKS_TOKEN in Render Environment."
-        )
+        logger.warning("⚠️ Token invalid — skipping cycle.")
         return
 
     active = scanner.get_active()
@@ -253,13 +262,13 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         result["confidence"]
     )
 
-    # ── Apply per-trade limit set via Telegram /setlimit ──
+    # Apply per-trade limit set via /setlimit
     qty = risk.apply_per_trade_limit(qty, ltp)
 
     margin = api.check_margin(
         cfg["security_id"], qty, ltp,
         segment=cfg["segment"],
-        product=cfg["product"]
+        product=TRADE_MODE        # ← uses live TRADE_MODE
     )
     if margin and margin["total_margin"] > balance:
         notifier.insufficient_margin(
@@ -276,7 +285,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         order_type="LIMIT",
         limit_price=round(ltp * 1.001, 2),
         segment=cfg["segment"],
-        product=cfg["product"],
+        product=TRADE_MODE,       # ← uses live TRADE_MODE
         exchange=cfg["exchange"]
     )
 
@@ -328,7 +337,7 @@ def process_exit(cfg: dict, ltp: float):
         qty=pos["qty"],
         order_type="MARKET",
         segment=cfg["segment"],
-        product=cfg["product"],
+        product=TRADE_MODE,       # ← uses live TRADE_MODE
         exchange=cfg["exchange"]
     )
 
@@ -384,7 +393,6 @@ def send_daily_summary():
     )
 
 def refresh_ws_subscriptions():
-    """Update WebSocket subscriptions after each Tier 1 scan."""
     new_tokens = scanner.get_ws_tokens()
     if price_feed.ws:
         try:
@@ -394,9 +402,7 @@ def refresh_ws_subscriptions():
                 "mode":        "ltp",
                 "instruments": new_tokens
             }))
-            logger.info(
-                f"🔄 WebSocket updated: {len(new_tokens)} instruments"
-            )
+            logger.info(f"🔄 WebSocket updated: {len(new_tokens)} instruments")
         except Exception as e:
             logger.error(f"WS subscription update error: {e}")
 
@@ -405,28 +411,18 @@ def refresh_ws_subscriptions():
 if __name__ == "__main__":
     logger.info("🚀 Booting algo bot — Full Market Mode...")
 
-    # Step 1: Load full instrument universe
     scanner.load_universe()
-
-    # Step 2: First Tier 1 scan — shortlist top instruments
     scanner.tier1_scan()
 
-    # Step 3: Start price feed WebSocket with shortlisted tokens
     price_feed.instruments = scanner.get_ws_tokens()
     price_feed.start()
 
-    # Step 4: Start order feed (REST polling mode)
     order_feed.start()
-
     time.sleep(2)
 
-    # Step 5: Start background Tier 1 refresh every 30 min
     scanner.start_background_refresh()
-
-    # Step 6: Start Telegram command listener
     notifier.start_command_listener(bot_ref=sys.modules[__name__])
 
-    # Step 7: Schedule all jobs
     schedule.every(60).seconds.do(run_cycle)
     schedule.every(30).minutes.do(refresh_ws_subscriptions)
     schedule.every().day.at("06:30").do(refresh_token)
@@ -435,16 +431,12 @@ if __name__ == "__main__":
     schedule.every().day.at("15:30").do(send_daily_summary)
     schedule.every().day.at("00:01").do(scanner.load_universe)
 
-    # Step 8: Startup alert
     notifier.bot_started()
 
     logger.info("✅ All systems running — scanning full NSE market")
-
-    # Step 9: Wait 3 minutes for initial model training to settle
     logger.info("⏳ Waiting 3 minutes for initial model training...")
     time.sleep(180)
 
-    # Step 10: Main loop
     while True:
         try:
             schedule.run_pending()

@@ -1,11 +1,14 @@
 requests
 python-dotenv
 pandas
-ta
+pandas-ta
 schedule
 websocket-client
 xgboost
 scikit-learn
+lightgbm
+torch
+stable-baselines3
 gymnasium
 numpy
 joblib

@@ -33,12 +33,12 @@ class FullMarketScanner:
 
     def __init__(self, api: INDstocksAPI,
                  top_n_equity: int = 10,
-                 top_n_fno: int = 5,
-                 top_n_index: int = 2):
-        self.api          = api
-        self.top_n_equity = top_n_equity
-        self.top_n_fno    = top_n_fno
-        self.top_n_index  = top_n_index
+                 top_n_fno: int    = 5,
+                 top_n_index: int  = 2):
+        self.api           = api
+        self.top_n_equity  = top_n_equity
+        self.top_n_fno     = top_n_fno
+        self.top_n_index   = top_n_index
 
         self.universe_equity = []
         self.universe_fno    = []
@@ -60,7 +60,10 @@ class FullMarketScanner:
             equity_df = self._fetch_instruments("equity")
             if equity_df is not None:
                 self.universe_equity = self._parse_equity(equity_df)
-                logger.info(f"✅ Equity universe: {len(self.universe_equity)} instruments")
+                logger.info(
+                    f"✅ Equity universe: "
+                    f"{len(self.universe_equity)} instruments"
+                )
         except Exception as e:
             logger.error(f"Equity universe load error: {e}")
 
@@ -68,7 +71,10 @@ class FullMarketScanner:
             fno_df = self._fetch_instruments("fno")
             if fno_df is not None:
                 self.universe_fno = self._parse_fno(fno_df)
-                logger.info(f"✅ FNO universe: {len(self.universe_fno)} instruments")
+                logger.info(
+                    f"✅ FNO universe: "
+                    f"{len(self.universe_fno)} instruments"
+                )
         except Exception as e:
             logger.error(f"FNO universe load error: {e}")
 
@@ -76,7 +82,10 @@ class FullMarketScanner:
             index_df = self._fetch_instruments("index")
             if index_df is not None:
                 self.universe_index = self._parse_index(index_df)
-                logger.info(f"✅ Index universe: {len(self.universe_index)} instruments")
+                logger.info(
+                    f"✅ Index universe: "
+                    f"{len(self.universe_index)} instruments"
+                )
         except Exception as e:
             logger.error(f"Index universe load error: {e}")
 
@@ -102,7 +111,10 @@ class FullMarketScanner:
                 logger.info(f"  {source}: {len(df)} rows downloaded")
                 return df
             else:
-                logger.error(f"Instruments fetch failed ({source}): {response.status_code}")
+                logger.error(
+                    f"Instruments fetch failed ({source}): "
+                    f"{response.status_code}"
+                )
                 return None
         except Exception as e:
             logger.error(f"Instruments fetch error ({source}): {e}")
@@ -117,7 +129,10 @@ class FullMarketScanner:
                 (df["INSTRUMENT_NAME"] == "EQUITY")
             ].copy()
         except KeyError as e:
-            logger.error(f"Equity filter error — missing column: {e}. Available: {df.columns.tolist()}")
+            logger.error(
+                f"Equity filter error — missing column: {e}. "
+                f"Available: {df.columns.tolist()}"
+            )
             return []
 
         instruments = []
@@ -147,6 +162,12 @@ class FullMarketScanner:
         return instruments
 
     def _parse_fno(self, df: pd.DataFrame) -> list:
+        """
+        Filter FNO CSV to current-month futures only.
+        scrip_code uses NFO_ prefix to match /market/quotes API format.
+        ws_token uses NFO: prefix for WebSocket subscriptions.
+        Both confirmed from API docs: SEGMENT_TOKEN and SEGMENT:TOKEN formats.
+        """
         df.columns = df.columns.str.strip()
         try:
             filtered = df[
@@ -154,7 +175,10 @@ class FullMarketScanner:
                 (df["EXPIRY_FLAG"] == "M")
             ].copy()
         except KeyError as e:
-            logger.error(f"FNO filter error — missing column: {e}. Available: {df.columns.tolist()}")
+            logger.error(
+                f"FNO filter error — missing column: {e}. "
+                f"Available: {df.columns.tolist()}"
+            )
             return []
 
         instruments = []
@@ -168,9 +192,9 @@ class FullMarketScanner:
                 )
                 instruments.append({
                     "name":        f"{name} Fut",
-                    "scrip_code":  f"NSE_{sid}",   # FIX 3: was NFO_{sid}
+                    "scrip_code":  f"NFO_{sid}",   # REST quotes: NFO_51011
                     "security_id": sid,
-                    "ws_token":    f"NFO:{sid}",   # correct for WebSocket
+                    "ws_token":    f"NFO:{sid}",   # WebSocket: NFO:51011
                     "segment":     "DERIVATIVE",
                     "product":     "MARGIN",
                     "exchange":    "NSE",
@@ -185,17 +209,22 @@ class FullMarketScanner:
         return instruments
 
     def _parse_index(self, df: pd.DataFrame) -> list:
+        """
+        Parse index instruments.
+        Falls back to SECURITY_ID as name if no name column exists
+        (index CSV only has EXCH, SEGMENT, SECURITY_ID).
+        """
         df.columns = df.columns.str.strip()
         logger.info(f"Index CSV columns: {df.columns.tolist()}")
 
         name_col = None
-        for col in ["SYMBOL_NAME", "TRADING_SYMBOL", "CUSTOM_SYMBOL", "INSTRUMENT_NAME"]:
+        for col in ["SYMBOL_NAME", "TRADING_SYMBOL",
+                    "CUSTOM_SYMBOL", "INSTRUMENT_NAME"]:
             if col in df.columns:
                 name_col = col
                 logger.info(f"Using index name column: {name_col}")
                 break
 
-        # FIX 4: fall back to SECURITY_ID instead of returning []
         if name_col is None:
             logger.warning(
                 f"No name column found in index CSV. "
@@ -260,6 +289,12 @@ class FullMarketScanner:
     def _score_batch(self, instruments: list,
                      min_price: float,
                      top_n: int) -> list:
+        """
+        Batch-fetch quotes for up to 500 instruments at a time.
+        Score by volume + volatility + momentum.
+        Return top N scored instruments.
+        scrip_code format NSE_TOKEN / NFO_TOKEN matches API docs exactly.
+        """
         if not instruments:
             return []
 
@@ -296,7 +331,10 @@ class FullMarketScanner:
                         continue
 
                     vol_score = min(volume / 1_000_000, 40)
-                    atr_pct   = (high - low) / price * 100 if price > 0 else 0
+                    atr_pct   = (
+                        (high - low) / price * 100
+                        if price > 0 else 0
+                    )
                     atr_score = min(atr_pct * 10, 40)
                     mom_score = min(change * 4, 20)
                     total     = vol_score + atr_score + mom_score
@@ -310,7 +348,10 @@ class FullMarketScanner:
                     })
 
             except Exception as e:
-                logger.error(f"Batch score error: {e}")
+                logger.error(
+                    f"Batch score error "
+                    f"(sample code: {scrip_codes[:30]}...): {e}"
+                )
 
             time.sleep(0.5)
 
@@ -321,7 +362,10 @@ class FullMarketScanner:
 
     def get_active(self) -> list:
         if time.time() - self._last_tier1 > self.TIER1_INTERVAL:
-            threading.Thread(target=self.tier1_scan, daemon=True).start()
+            threading.Thread(
+                target=self.tier1_scan,
+                daemon=True
+            ).start()
 
         with self._lock:
             return (

@@ -47,24 +47,27 @@ posmgr = PositionManager(
     min_confidence=MIN_CONFIDENCE
 )
 
-# ── ML Trainers — created lazily per instrument ───────────────
-trainers = {}
+# ── ML Trainers ───────────────────────────────────────────────
+trainers      = {}
+_trainer_lock = threading.Lock()  # FIX 2: prevent race condition on init
 
 def get_trainer(cfg: dict) -> AutoTrainer:
-    """Get or create ML trainer for an instrument."""
+    """Get or create ML trainer for an instrument. Thread-safe."""
     key = cfg["scrip_code"]
     if key not in trainers:
-        trainers[key] = AutoTrainer(
-            cfg["scrip_code"],
-            cfg["security_id"],
-            INTERVAL
-        )
-        trainers[key].start_schedule(retrain_time="18:30")
-        logger.info(f"🧠 Trainer created for {cfg['name']}")
+        with _trainer_lock:
+            if key not in trainers:  # double-checked locking
+                trainers[key] = AutoTrainer(
+                    cfg["scrip_code"],
+                    cfg["security_id"],
+                    INTERVAL
+                )
+                trainers[key].start_schedule(retrain_time="18:30")
+                logger.info(f"🧠 Trainer created for {cfg['name']}")
+                time.sleep(1.0)  # FIX 2: stagger API calls on trainer init
     return trainers[key]
 
 # ── WebSocket Feeds ───────────────────────────────────────────
-# Starts empty — tokens added after universe loads at boot
 
 def on_price_tick(token, ltp):
     logger.debug(f"Tick → {token}: ₹{ltp}")
@@ -119,10 +122,8 @@ def run_cycle():
     signals      = []
     exit_signals = []
 
-    # ── Scan all active instruments in parallel ───────────────
     def scan_instrument(cfg):
         try:
-            # LTP from WebSocket cache, fallback to REST
             token = cfg["ws_token"].split(":")[1]
             ltp   = price_feed.get_ltp(token)
             if ltp is None:
@@ -131,7 +132,13 @@ def run_cycle():
             if not ltp:
                 return
 
-            df     = get_candles(cfg["scrip_code"])
+            df = get_candles(cfg["scrip_code"])
+
+            # FIX 6: guard against empty/insufficient candle data
+            if df is None or len(df) < 50:
+                logger.warning(f"[{cfg['name']}] Insufficient candle data, skipping.")
+                return
+
             result = get_trainer(cfg).get_signal(df)
 
             logger.info(
@@ -160,11 +167,9 @@ def run_cycle():
     for t in threads:
         t.join(timeout=15)
 
-    # ── Exits first ───────────────────────────────────────────
     for entry in exit_signals:
         process_exit(entry["cfg"], entry["ltp"])
 
-    # ── Ranked entries ────────────────────────────────────────
     ranked = posmgr.rank_signals(signals)
     logger.info(
         f"📊 {len(ranked)} actionable signals | "
@@ -182,7 +187,6 @@ def run_cycle():
             continue
         process_entry(entry["cfg"], entry["result"], entry["ltp"])
 
-    # ── Portfolio snapshot ────────────────────────────────────
     status = posmgr.status()
     logger.info(
         f"📁 Open: {status['open_positions']} | "
@@ -196,13 +200,11 @@ def run_cycle():
 def process_entry(cfg: dict, result: dict, ltp: float):
     balance = get_balance(cfg["segment"])
 
-    # Kill switch check
     if not risk.can_trade(balance):
         limit = balance * risk.daily_loss_limit_pct
         notifier.kill_switch(risk.daily_pnl, limit)
         return
 
-    # Warn at 80% of daily loss limit
     limit = balance * risk.daily_loss_limit_pct
     if risk.daily_pnl < -(limit * 0.8):
         notifier.risk_warning(risk.daily_pnl, limit, balance)
@@ -213,21 +215,15 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         result["confidence"]
     )
 
-    # Margin check
     margin = api.check_margin(
         cfg["security_id"], qty, ltp,
         segment=cfg["segment"],
         product=cfg["product"]
     )
     if margin and margin["total_margin"] > balance:
-        notifier.insufficient_margin(
-            cfg["name"],
-            margin["total_margin"],
-            balance
-        )
+        notifier.insufficient_margin(cfg["name"], margin["total_margin"], balance)
         return
 
-    # Place BUY order
     order = api.place_order(
         txn_type="BUY",
         security_id=cfg["security_id"],
@@ -335,10 +331,6 @@ def send_daily_summary():
     )
 
 def refresh_ws_subscriptions():
-    """
-    After each Tier 1 scan the shortlist changes.
-    Update WebSocket subscriptions to match new shortlist.
-    """
     new_tokens = scanner.get_ws_tokens()
     if price_feed.ws:
         try:
@@ -357,41 +349,27 @@ def refresh_ws_subscriptions():
 if __name__ == "__main__":
     logger.info("🚀 Booting algo bot — Full Market Mode...")
 
-    # Step 1: Load full instrument universe from API
-    # Downloads equity + FNO + index CSVs
     scanner.load_universe()
-
-    # Step 2: Run first Tier 1 scan
-    # Scores all instruments, shortlists top 50 equity + 10 FNO
     scanner.tier1_scan()
 
-    # Step 3: Start WebSocket with shortlisted tokens
     price_feed.instruments = scanner.get_ws_tokens()
     price_feed.start()
     order_feed.start()
     time.sleep(2)
 
-    # Step 4: Start background Tier 1 refresh every 30 min
     scanner.start_background_refresh()
-
-    # Step 5: Start Telegram command listener
     notifier.start_command_listener(bot_ref=sys.modules[__name__])
 
-    # Step 6: Schedule all jobs
     schedule.every(60).seconds.do(run_cycle)
     schedule.every(30).minutes.do(refresh_ws_subscriptions)
     schedule.every().day.at("09:14").do(daily_reset)
     schedule.every().day.at(SQUAREOFF_AT).do(square_off_all)
     schedule.every().day.at("15:30").do(send_daily_summary)
-    # Reload full universe CSV daily at midnight
     schedule.every().day.at("00:01").do(scanner.load_universe)
 
-    # Step 7: Send startup alert
     notifier.bot_started()
-
     logger.info("✅ All systems running — scanning full NSE market")
 
-    # Step 8: Main loop
     while True:
         try:
             schedule.run_pending()

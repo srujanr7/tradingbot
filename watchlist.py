@@ -33,12 +33,12 @@ class FullMarketScanner:
 
     def __init__(self, api: INDstocksAPI,
                  top_n_equity: int = 10,
-                 top_n_fno: int    = 5,
-                 top_n_index: int  = 2):
-        self.api           = api
-        self.top_n_equity  = top_n_equity
-        self.top_n_fno     = top_n_fno
-        self.top_n_index   = top_n_index
+                 top_n_fno: int = 5,
+                 top_n_index: int = 2):
+        self.api          = api
+        self.top_n_equity = top_n_equity
+        self.top_n_fno    = top_n_fno
+        self.top_n_index  = top_n_index
 
         self.universe_equity = []
         self.universe_fno    = []
@@ -54,21 +54,13 @@ class FullMarketScanner:
     # ── Tier 0: Load full instrument universe ─────────────────
 
     def load_universe(self):
-        """
-        Downloads all instruments from INDstocks API.
-        Each segment is wrapped in try/except so one
-        bad CSV never crashes the whole bot.
-        """
         logger.info("📥 Loading full instrument universe from API...")
 
         try:
             equity_df = self._fetch_instruments("equity")
             if equity_df is not None:
                 self.universe_equity = self._parse_equity(equity_df)
-                logger.info(
-                    f"✅ Equity universe: "
-                    f"{len(self.universe_equity)} instruments"
-                )
+                logger.info(f"✅ Equity universe: {len(self.universe_equity)} instruments")
         except Exception as e:
             logger.error(f"Equity universe load error: {e}")
 
@@ -76,10 +68,7 @@ class FullMarketScanner:
             fno_df = self._fetch_instruments("fno")
             if fno_df is not None:
                 self.universe_fno = self._parse_fno(fno_df)
-                logger.info(
-                    f"✅ FNO universe: "
-                    f"{len(self.universe_fno)} instruments"
-                )
+                logger.info(f"✅ FNO universe: {len(self.universe_fno)} instruments")
         except Exception as e:
             logger.error(f"FNO universe load error: {e}")
 
@@ -87,10 +76,7 @@ class FullMarketScanner:
             index_df = self._fetch_instruments("index")
             if index_df is not None:
                 self.universe_index = self._parse_index(index_df)
-                logger.info(
-                    f"✅ Index universe: "
-                    f"{len(self.universe_index)} instruments"
-                )
+                logger.info(f"✅ Index universe: {len(self.universe_index)} instruments")
         except Exception as e:
             logger.error(f"Index universe load error: {e}")
 
@@ -102,7 +88,6 @@ class FullMarketScanner:
         )
 
     def _fetch_instruments(self, source: str) -> pd.DataFrame:
-        """Download instruments CSV and parse into DataFrame."""
         token = os.getenv("INDSTOCKS_TOKEN")
         try:
             response = requests.get(
@@ -113,30 +98,18 @@ class FullMarketScanner:
             )
             if response.status_code == 200:
                 df = pd.read_csv(io.StringIO(response.text))
-                # Strip whitespace from column names
                 df.columns = df.columns.str.strip()
-                logger.info(
-                    f"  {source}: {len(df)} rows downloaded"
-                )
+                logger.info(f"  {source}: {len(df)} rows downloaded")
                 return df
             else:
-                logger.error(
-                    f"Instruments fetch failed ({source}): "
-                    f"{response.status_code}"
-                )
+                logger.error(f"Instruments fetch failed ({source}): {response.status_code}")
                 return None
         except Exception as e:
             logger.error(f"Instruments fetch error ({source}): {e}")
             return None
 
     def _parse_equity(self, df: pd.DataFrame) -> list:
-        """
-        Filter equity CSV to NSE EQ series stocks only.
-        Returns list of instrument dicts.
-        """
-        # Strip column whitespace just in case
         df.columns = df.columns.str.strip()
-
         try:
             filtered = df[
                 (df["EXCH"]            == "NSE") &
@@ -144,16 +117,13 @@ class FullMarketScanner:
                 (df["INSTRUMENT_NAME"] == "EQUITY")
             ].copy()
         except KeyError as e:
-            logger.error(
-                f"Equity filter error — missing column: {e}. "
-                f"Available: {df.columns.tolist()}"
-            )
+            logger.error(f"Equity filter error — missing column: {e}. Available: {df.columns.tolist()}")
             return []
 
         instruments = []
         for _, row in filtered.iterrows():
             try:
-                sid = str(row["SECURITY_ID"])
+                sid  = str(row["SECURITY_ID"])
                 name = str(
                     row.get("SYMBOL_NAME") or
                     row.get("TRADING_SYMBOL") or
@@ -177,22 +147,14 @@ class FullMarketScanner:
         return instruments
 
     def _parse_fno(self, df: pd.DataFrame) -> list:
-        """
-        Filter FNO CSV to current-month futures only.
-        Excludes options to keep manageable.
-        """
         df.columns = df.columns.str.strip()
-
         try:
             filtered = df[
                 (df["INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX"])) &
                 (df["EXPIRY_FLAG"] == "M")
             ].copy()
         except KeyError as e:
-            logger.error(
-                f"FNO filter error — missing column: {e}. "
-                f"Available: {df.columns.tolist()}"
-            )
+            logger.error(f"FNO filter error — missing column: {e}. Available: {df.columns.tolist()}")
             return []
 
         instruments = []
@@ -206,9 +168,9 @@ class FullMarketScanner:
                 )
                 instruments.append({
                     "name":        f"{name} Fut",
-                    "scrip_code":  f"NFO_{sid}",
+                    "scrip_code":  f"NSE_{sid}",   # FIX 3: was NFO_{sid}
                     "security_id": sid,
-                    "ws_token":    f"NFO:{sid}",
+                    "ws_token":    f"NFO:{sid}",   # correct for WebSocket
                     "segment":     "DERIVATIVE",
                     "product":     "MARGIN",
                     "exchange":    "NSE",
@@ -223,29 +185,24 @@ class FullMarketScanner:
         return instruments
 
     def _parse_index(self, df: pd.DataFrame) -> list:
-        """
-        Parse index instruments.
-        Handles different column names across CSV versions.
-        """
         df.columns = df.columns.str.strip()
         logger.info(f"Index CSV columns: {df.columns.tolist()}")
 
-        # Try multiple possible name columns
         name_col = None
-        for col in ["SYMBOL_NAME", "TRADING_SYMBOL",
-                    "CUSTOM_SYMBOL", "INSTRUMENT_NAME"]:
+        for col in ["SYMBOL_NAME", "TRADING_SYMBOL", "CUSTOM_SYMBOL", "INSTRUMENT_NAME"]:
             if col in df.columns:
                 name_col = col
                 logger.info(f"Using index name column: {name_col}")
                 break
 
+        # FIX 4: fall back to SECURITY_ID instead of returning []
         if name_col is None:
             logger.warning(
-                "Could not find name column in index CSV. "
+                f"No name column found in index CSV. "
                 f"Available: {df.columns.tolist()}. "
-                "Skipping index universe."
+                f"Falling back to SECURITY_ID."
             )
-            return []
+            name_col = "SECURITY_ID"
 
         instruments = []
         for _, row in df.iterrows():
@@ -264,18 +221,12 @@ class FullMarketScanner:
                 logger.warning(f"Skipping index row: {e}")
                 continue
 
-        logger.info(
-            f"Index universe: {len(instruments)} instruments"
-        )
+        logger.info(f"Index universe: {len(instruments)} instruments")
         return instruments
 
     # ── Tier 1: Score and shortlist ───────────────────────────
 
     def tier1_scan(self):
-        """
-        Quick scan of full universe using LTP + volume data.
-        Shortlists top N candidates for deep ML scan.
-        """
         logger.info("🔍 Tier 1: Scoring full market universe...")
         start = time.time()
 
@@ -289,7 +240,6 @@ class FullMarketScanner:
             min_price=self.MIN_PRICE_FNO,
             top_n=self.TIER1_SHORTLIST // 5
         )
-        # Index just use first N — no scoring needed
         index_shortlist = self.universe_index[:10]
 
         with self._lock:
@@ -298,7 +248,7 @@ class FullMarketScanner:
             self.shortlist_index  = index_shortlist
             self._last_tier1      = time.time()
 
-        elapsed = time.time() - start
+        elapsed   = time.time() - start
         top_names = [s["name"] for s in equity_shortlist[:5]]
         logger.info(
             f"✅ Tier 1 complete in {elapsed:.1f}s | "
@@ -310,11 +260,6 @@ class FullMarketScanner:
     def _score_batch(self, instruments: list,
                      min_price: float,
                      top_n: int) -> list:
-        """
-        Batch-fetch LTP for up to 500 instruments at a time.
-        Score by volume + volatility + momentum.
-        Return top N scored instruments.
-        """
         if not instruments:
             return []
 
@@ -323,9 +268,7 @@ class FullMarketScanner:
 
         for i in range(0, len(instruments), batch_size):
             batch       = instruments[i:i + batch_size]
-            scrip_codes = ",".join(
-                [inst["scrip_code"] for inst in batch]
-            )
+            scrip_codes = ",".join([inst["scrip_code"] for inst in batch])
 
             try:
                 quotes = self.api._request(
@@ -343,9 +286,7 @@ class FullMarketScanner:
 
                     price  = data.get("live_price", 0)
                     volume = data.get("volume", 0)
-                    change = abs(
-                        data.get("day_change_percentage", 0)
-                    )
+                    change = abs(data.get("day_change_percentage", 0))
                     high   = data.get("day_high", price)
                     low    = data.get("day_low",  price)
 
@@ -354,12 +295,8 @@ class FullMarketScanner:
                     if volume < self.MIN_VOLUME:
                         continue
 
-                    # Score: volume(40) + volatility(40) + momentum(20)
                     vol_score = min(volume / 1_000_000, 40)
-                    atr_pct   = (
-                        (high - low) / price * 100
-                        if price > 0 else 0
-                    )
+                    atr_pct   = (high - low) / price * 100 if price > 0 else 0
                     atr_score = min(atr_pct * 10, 40)
                     mom_score = min(change * 4, 20)
                     total     = vol_score + atr_score + mom_score
@@ -383,15 +320,8 @@ class FullMarketScanner:
     # ── Public API ────────────────────────────────────────────
 
     def get_active(self) -> list:
-        """
-        Returns current shortlist for ML scanning.
-        Auto-triggers background Tier 1 refresh if stale.
-        """
         if time.time() - self._last_tier1 > self.TIER1_INTERVAL:
-            threading.Thread(
-                target=self.tier1_scan,
-                daemon=True
-            ).start()
+            threading.Thread(target=self.tier1_scan, daemon=True).start()
 
         with self._lock:
             return (
@@ -400,10 +330,6 @@ class FullMarketScanner:
             )
 
     def get_ws_tokens(self) -> list:
-        """
-        Returns all WebSocket tokens from current shortlist.
-        Called on startup and after each Tier 1 refresh.
-        """
         with self._lock:
             all_insts = (
                 self.shortlist_equity +
@@ -413,10 +339,6 @@ class FullMarketScanner:
             return [inst["ws_token"] for inst in all_insts]
 
     def start_background_refresh(self):
-        """
-        Runs Tier 1 scan every 30 minutes in background.
-        Keeps shortlist fresh with today's top movers.
-        """
         def _loop():
             while True:
                 try:

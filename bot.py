@@ -407,5 +407,3 @@ if __name__ == "__main__":
             logger.error(f"Main loop error: {e}")
             notifier.error("MainLoopError", str(e))
             time.sleep(5)
-```
-

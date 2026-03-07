@@ -23,7 +23,13 @@ except ImportError:
     logger.warning("RL libraries not available. Running XGBoost only.")
 
 
+# ── XGBoost Signal Classifier ─────────────────────────────────
+
 class XGBSignalModel:
+    """
+    Predicts BUY (1) / SELL (0) signal from features.
+    Uses TimeSeriesSplit to avoid lookahead bias.
+    """
     def __init__(self, model_path="ml/xgb_model.pkl"):
         self.model_path   = model_path
         self.scaler       = StandardScaler()
@@ -60,22 +66,29 @@ class XGBSignalModel:
                 verbose=False
             )
             preds = self.model.predict(X_val_sc)
-            logger.info(f"Fold {fold+1}:\n{classification_report(y_val, preds)}")
+            logger.info(
+                f"Fold {fold+1}:\n"
+                f"{classification_report(y_val, preds)}"
+            )
 
         self.is_trained = True
         self.save()
         logger.info(f"XGB model trained on {len(X)} samples")
 
     def predict(self, features: pd.DataFrame) -> dict:
+        """Returns signal and confidence score."""
         if not self.is_trained:
             return {"signal": "HOLD", "confidence": 0.0}
+
         row        = features[self.feature_cols].iloc[[-1]]
         row_sc     = self.scaler.transform(row)
         proba      = self.model.predict_proba(row_sc)[0]
         confidence = max(proba)
         label      = int(self.model.predict(row_sc)[0])
+
         if confidence < 0.60:
             return {"signal": "HOLD", "confidence": confidence}
+
         return {
             "signal":     "BUY" if label == 1 else "SELL",
             "confidence": confidence
@@ -87,6 +100,7 @@ class XGBSignalModel:
             "scaler":       self.scaler,
             "feature_cols": self.feature_cols
         }, self.model_path)
+        logger.info(f"XGB model saved to {self.model_path}")
 
     def load(self):
         if os.path.exists(self.model_path):
@@ -100,23 +114,23 @@ class XGBSignalModel:
             logger.warning("No saved XGB model. Will train from scratch.")
 
 
-class TradingEnv:
-    pass
-
+# ── RL Agent ──────────────────────────────────────────────────
 
 class RLAgent:
     """
-    RL Agent — uses PPO if available, falls back to HOLD if not.
+    RL Agent using PPO if stable-baselines3 is available.
+    Falls back to HOLD signal safely if not installed.
+    This keeps Railway deployment lightweight.
     """
     def __init__(self, model_path="ml/ppo_model"):
-        self.model_path  = model_path
-        self.model       = None
-        self.available   = RL_AVAILABLE
+        self.model_path = model_path
+        self.model      = None
+        self.available  = RL_AVAILABLE
 
     def train(self, features: pd.DataFrame, prices: pd.Series,
               timesteps: int = 300_000):
         if not self.available:
-            logger.warning("Skipping RL training — libraries not installed")
+            logger.warning("Skipping RL training — not installed")
             return
 
         import gymnasium as gym
@@ -126,55 +140,67 @@ class RLAgent:
 
         class _TradingEnv(gym.Env):
             metadata = {"render_modes": []}
-            def __init__(self, features, prices, initial_balance=100_000):
+
+            def __init__(self, features, prices,
+                         initial_balance=100_000):
                 super().__init__()
-                self.features    = features.reset_index(drop=True)
-                self.prices      = prices.reset_index(drop=True)
-                self.n_steps     = len(features)
-                self.init_bal    = initial_balance
-                n_features       = features.shape[1] + 2
+                self.features  = features.reset_index(drop=True)
+                self.prices    = prices.reset_index(drop=True)
+                self.n_steps   = len(features)
+                self.init_bal  = initial_balance
+                n_feat         = features.shape[1] + 2
                 self.observation_space = spaces.Box(
                     low=-np.inf, high=np.inf,
-                    shape=(n_features,), dtype=np.float32
+                    shape=(n_feat,), dtype=np.float32
                 )
                 self.action_space = spaces.Discrete(3)
                 self.reset()
 
             def _obs(self):
-                row        = self.features.iloc[self.step].values.astype(np.float32)
-                price      = self.prices.iloc[self.step]
-                unrealized = ((price - self.entry_price) / self.entry_price
-                              if self.position else 0.0)
-                return np.append(row, [float(self.position), unrealized])
+                row  = self.features.iloc[
+                    self.current_step
+                ].values.astype(np.float32)
+                price = self.prices.iloc[self.current_step]
+                unrealized = (
+                    (price - self.entry_price) / self.entry_price
+                    if self.position else 0.0
+                )
+                return np.append(row, [float(self.position),
+                                       unrealized])
 
             def reset(self, seed=None, options=None):
                 super().reset(seed=seed)
-                self.step        = 0
-                self.position    = 0
-                self.entry_price = 0.0
-                self.balance     = self.init_bal
-                self.hold_count  = 0
+                self.current_step = 0
+                self.position     = 0
+                self.entry_price  = 0.0
+                self.balance      = self.init_bal
+                self.hold_count   = 0
                 return self._obs(), {}
 
             def step(self, action):
-                price  = self.prices.iloc[self.step]
+                price  = self.prices.iloc[self.current_step]
                 reward = 0.0
+
                 if action == 1 and self.position == 0:
                     self.position    = 1
                     self.entry_price = price
                     self.hold_count  = 0
+
                 elif action == 2 and self.position == 1:
-                    pnl              = (price - self.entry_price) / self.entry_price
+                    pnl              = ((price - self.entry_price)
+                                        / self.entry_price)
                     reward           = pnl * 100
                     self.balance    *= (1 + pnl)
                     self.position    = 0
                     self.entry_price = 0.0
                     self.hold_count  = 0
+
                 elif action == 0 and self.position == 1:
                     self.hold_count += 1
                     reward           = -0.001 * self.hold_count
-                self.step += 1
-                done = self.step >= self.n_steps - 1
+
+                self.current_step += 1
+                done = self.current_step >= self.n_steps - 1
                 return self._obs(), reward, done, False, {}
 
         env        = DummyVecEnv([lambda: _TradingEnv(features, prices)])
@@ -187,22 +213,29 @@ class RLAgent:
             gamma=0.99,
             verbose=1
         )
-        self.model.learn(total_timesteps=timesteps,
-                         reset_num_timesteps=False)
+        self.model.learn(
+            total_timesteps=timesteps,
+            reset_num_timesteps=False
+        )
         self.model.save(self.model_path)
         logger.info(f"PPO model saved to {self.model_path}")
 
     def load(self):
         if not self.available:
+            logger.warning("RL not available. Skipping load.")
             return
         if os.path.exists(f"{self.model_path}.zip"):
             from stable_baselines3 import PPO
             self.model = PPO.load(self.model_path)
-            logger.info("PPO model loaded")
+            logger.info("PPO model loaded from disk")
         else:
             logger.warning("No PPO model found.")
 
     def predict(self, obs: np.ndarray) -> int:
+        """
+        Returns action: 0=Hold, 1=Buy, 2=Sell
+        Returns 0 (Hold) safely if RL not available.
+        """
         if not self.available or self.model is None:
             return 0
         action, _ = self.model.predict(obs, deterministic=True)

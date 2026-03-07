@@ -603,6 +603,52 @@ class TelegramNotifier:
             except ValueError:
                 self._send("❌ Invalid. Usage: <code>/setslots 3 2</code>")
 
+        # ── /performance ──────────────────────────────────────
+        elif cmd == "/performance":
+            if not ref:
+                return
+            from ml.trade_memory import TradeMemory
+            mem   = TradeMemory()
+            stats = mem.get_stats()
+            pf    = stats.get("profit_factor", 0)
+            self._send(
+                "📈 <b>ALL-TIME PERFORMANCE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Total Trades   : {stats['total']}\n"
+                f"Wins           : {stats['wins']}\n"
+                f"Losses         : {stats['losses']}\n"
+                f"Win Rate       : {stats['win_rate']}%\n"
+                f"Avg Win        : ₹{stats['avg_win']:+,.2f}\n"
+                f"Avg Loss       : ₹{stats['avg_loss']:+,.2f}\n"
+                f"Profit Factor  : {pf:.2f}x\n"
+                f"Best Trade     : ₹{stats['best_trade']:+,.2f}\n"
+                f"Worst Trade    : ₹{stats['worst_trade']:+,.2f}\n"
+                f"Total PnL      : ₹{stats['total_pnl']:+,.2f}\n"
+                f"Time           : {self._now()}"
+            )
+        
+        # ── /models ───────────────────────────────────────────
+        elif cmd == "/models":
+            if not ref:
+                return
+            import os
+            model_dir = "ml/models"
+            if not os.path.exists(model_dir):
+                self._send("No models trained yet.")
+                return
+            files  = os.listdir(model_dir)
+            ppo    = [f for f in files if f.startswith("ppo")]
+            a2c    = [f for f in files if f.startswith("a2c")]
+            self._send(
+                "🤖 <b>TRAINED MODELS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"PPO models : {len(ppo)} instruments\n"
+                f"A2C models : {len(a2c)} instruments\n\n"
+                f"Models retrain daily at 18:30\n"
+                f"More trades = smarter models\n"
+                f"Time : {self._now()}"
+            )
+
         # ── /settrades <n> ────────────────────────────────
         elif cmd == "/settrades":
             if not args:
@@ -629,3 +675,4 @@ class TelegramNotifier:
 
     def _now(self) -> str:
         return datetime.now().strftime("%d %b %Y %H:%M:%S")
+

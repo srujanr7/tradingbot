@@ -68,7 +68,7 @@ class PriceFeed:
     def _connect(self):
         self.ws = websocket.WebSocketApp(
             self.WS_URL,
-            header=[f"Authorization: {self.token}"],
+            header=[f"Authorization: Bearer {self.token}"],
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
@@ -144,7 +144,7 @@ class OrderFeed:
     def _connect(self):
         self.ws = websocket.WebSocketApp(
             self.WS_URL,
-            header=[f"Authorization: {self.token}"],
+            header=[f"Authorization: Bearer {self.token}"],
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,

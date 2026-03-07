@@ -1,11 +1,9 @@
 import sys
-import os
 import time
 import logging
 import schedule
 import threading
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from api import INDstocksAPI
 from risk import RiskManager
 from websocket_feed import PriceFeed, OrderFeed
@@ -24,20 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Health check server so Render doesn't kill the service ───
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass  # silence access logs
-
-def _start_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
-
-threading.Thread(target=_start_health_server, daemon=True).start()
 # ─────────────────────────────────────────────────────────────
 
 # ── Log outbound IP on boot so you can register it on INDstocks

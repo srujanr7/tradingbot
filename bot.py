@@ -1,9 +1,11 @@
 import sys
+import os
 import time
 import logging
 import schedule
 import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from api import INDstocksAPI
 from risk import RiskManager
 from websocket_feed import PriceFeed, OrderFeed
@@ -21,6 +23,22 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ── Health check server so Render doesn't kill the service ───
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # silence access logs
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+
+threading.Thread(target=_start_health_server, daemon=True).start()
+# ─────────────────────────────────────────────────────────────
 
 # ── Log outbound IP on boot so you can register it on INDstocks
 import requests as _req
@@ -79,28 +97,18 @@ def get_trainer(cfg: dict) -> AutoTrainer:
 # ── Token Refresh ─────────────────────────────────────────────
 
 def refresh_token():
-    """
-    Fires every morning at 06:30 — 30 min after the 6AM token reset.
-    Sends a Telegram alert with Render-specific instructions.
-    On Render, updating the env var triggers an auto-redeploy
-    which boots the bot fresh with the new token.
-    No polling needed — the redeploy handles everything.
-    """
     logger.info("🔑 Daily token refresh alert sending...")
     notifier.send(
-        "🔑 *Action Required: Daily Token Refresh*\n\n"
+        "🔑 <b>Action Required: Daily Token Refresh</b>\n\n"
         "INDstocks token expired at 6AM.\n\n"
         "1️⃣ Open INDstocks → Algo Access → New Token\n"
         "2️⃣ Copy the new token\n"
         "3️⃣ Open Render → tradingbot → Environment\n"
-        "4️⃣ Update `INDSTOCKS_TOKEN` → Save Changes\n"
+        "4️⃣ Update <code>INDSTOCKS_TOKEN</code> → Save Changes\n"
         "5️⃣ Render redeploys automatically in ~60 sec\n\n"
         "⏰ Complete before 9:15AM market open"
     )
-    logger.info(
-        "🔑 Token refresh alert sent via Telegram. "
-        "Update INDSTOCKS_TOKEN in Render Environment to redeploy."
-    )
+    logger.info("🔑 Token refresh alert sent via Telegram.")
 
 # ── WebSocket Price Feed ──────────────────────────────────────
 
@@ -119,7 +127,6 @@ price_feed = PriceFeed(
     mode="ltp",
     on_tick=on_price_tick
 )
-# REST-only order feed — no WebSocket needed at 15min timeframe
 order_feed = OrderFeed(on_update=on_order_update)
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -129,11 +136,6 @@ def is_market_open() -> bool:
     return MARKET_OPEN <= now <= MARKET_CLOSE
 
 def get_candles(scrip_code: str):
-    """
-    Fetch last 5 days of 15-min candles.
-    5 days stays safely within the 7-day API limit and gives
-    ~100 candles on trading days — enough for all indicators.
-    """
     end   = int(time.time() * 1000)
     start = end - (5 * 24 * 60 * 60 * 1000)
     return api.get_historical(scrip_code, INTERVAL, start, end)
@@ -155,7 +157,6 @@ def run_cycle():
         logger.info("Bot paused via Telegram.")
         return
 
-    # Block trading if token is known invalid
     if not api.is_token_valid():
         logger.warning(
             "⚠️ Token invalid — skipping cycle. "
@@ -181,7 +182,6 @@ def run_cycle():
             if not ltp:
                 return
 
-            # Fetch candles with one retry on insufficient data
             df = get_candles(cfg["scrip_code"])
             if df is None or len(df) < 30:
                 time.sleep(2)
@@ -255,11 +255,11 @@ def process_entry(cfg: dict, result: dict, ltp: float):
     balance = get_balance(cfg["segment"])
 
     if not risk.can_trade(balance):
-        limit = balance * risk.daily_loss_limit_pct
+        limit = risk.get_daily_limit(balance)
         notifier.kill_switch(risk.daily_pnl, limit)
         return
 
-    limit = balance * risk.daily_loss_limit_pct
+    limit = risk.get_daily_limit(balance)
     if risk.daily_pnl < -(limit * 0.8):
         notifier.risk_warning(risk.daily_pnl, limit, balance)
 
@@ -268,6 +268,9 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         cfg["segment"],
         result["confidence"]
     )
+
+    # ── Apply per-trade limit set via Telegram /setlimit ──
+    qty = risk.apply_per_trade_limit(qty, ltp)
 
     margin = api.check_margin(
         cfg["security_id"], qty, ltp,

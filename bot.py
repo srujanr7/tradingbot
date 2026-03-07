@@ -367,6 +367,24 @@ def process_exit(cfg: dict, ltp: float):
         pnl        = closed.get("pnl", 0)
         risk.update_pnl(pnl)
 
+        from ml.trade_memory import TradeMemory
+        TradeMemory().record({
+            "scrip_code":   cfg["scrip_code"],
+            "name":         cfg["name"],
+            "segment":      pos["segment"],
+            "side":         "BUY",
+            "entry":        pos["entry"],
+            "exit":         exit_price,
+            "qty":          pos["qty"],
+            "pnl":          pnl,
+            "pnl_pct":      pnl_pct,
+            "hold_minutes": 15,   # approximate
+            "confidence":   pos.get("signal_meta", {}).get("confidence", 0),
+            "xgb":          pos.get("signal_meta", {}).get("xgb", ""),
+            "rl":           pos.get("signal_meta", {}).get("rl", ""),
+            "sentiment":    pos.get("signal_meta", {}).get("sentiment", 0),
+        })
+
         notifier.trade_closed(
             name=cfg["name"],
             qty=pos["qty"],

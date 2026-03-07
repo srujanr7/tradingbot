@@ -92,24 +92,22 @@ class PriceFeed:
 
 
 class OrderFeed:
-    """
-    Streams real-time order status updates.
-    Calls on_update(order_data) on every order state change.
-    """
     WS_URL = "wss://ws-order-updates.indstocks.com"
 
     def __init__(self, on_update=None):
-        self.on_update = on_update
-        self.token = os.getenv("INDSTOCKS_TOKEN")
-        self.ws = None
-        self._running = False
+        self.on_update    = on_update
+        self.token        = os.getenv("INDSTOCKS_TOKEN")
+        self.ws           = None
+        self._running     = False
         self.order_states = {}
+        self._ws_alive    = False  # track if WS actually connected
 
     def _on_open(self, ws):
         logger.info("✅ Order feed connected")
+        self._ws_alive = True
         ws.send(json.dumps({
             "action": "subscribe",
-            "mode": "order_updates"
+            "mode":   "order_updates"
         }))
 
     def _on_message(self, ws, message):
@@ -117,7 +115,7 @@ class OrderFeed:
             data = json.loads(message)
             if data.get("type") == "order":
                 order_id = data["order_id"]
-                status = data["order_status"]
+                status   = data["order_status"]
                 self.order_states[order_id] = data
                 logger.info(f"Order update → {order_id}: {status}")
                 if self.on_update:
@@ -127,8 +125,10 @@ class OrderFeed:
 
     def _on_error(self, ws, error):
         logger.error(f"Order feed error: {error}")
+        self._ws_alive = False
 
     def _on_close(self, ws, code, msg):
+        self._ws_alive = False
         logger.warning(f"Order feed closed: {code} {msg}")
         if self._running:
             logger.info("Order feed reconnecting in 5s...")
@@ -138,7 +138,7 @@ class OrderFeed:
     def _connect(self):
         self.ws = websocket.WebSocketApp(
             self.WS_URL,
-            header=[f"Authorization: {self.token}"],  # FIX 1: list of strings
+            header=[f"Authorization: {self.token}"],
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
@@ -158,13 +158,54 @@ class OrderFeed:
         if self.ws:
             self.ws.close()
 
+    def _poll_order_rest(self, order_id: str) -> dict:
+        """
+        REST fallback when WebSocket is unavailable.
+        Calls GET /orders/{order_id} directly.
+        """
+        import requests
+        try:
+            resp = requests.get(
+                f"https://api.indstocks.com/orders/{order_id}",
+                headers={"Authorization": self.token},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Normalise to same shape as WS order update
+                return {
+                    "order_id":           order_id,
+                    "order_status":       data.get("order_status", ""),
+                    "filled_quantity":    data.get("filled_qty", 0),
+                    "remaining_quantity": data.get("remaining_qty", 0),
+                    "average_price":      data.get("average_price", 0),
+                }
+        except Exception as e:
+            logger.error(f"Order REST poll error: {e}")
+        return {}
+
     def wait_for_fill(self, order_id: str, timeout: int = 30) -> dict:
-        start = time.time()
+        """
+        Wait for order to reach terminal state.
+        Uses WebSocket cache if WS is alive, otherwise falls back to REST polling.
+        """
+        terminal = {"SUCCESS", "FAILED", "CANCELLED", "PARTIALLY_EXECUTED"}
+        start    = time.time()
+
         while time.time() - start < timeout:
+            # Try WS cache first
             state = self.order_states.get(order_id, {})
-            if state.get("order_status") in (
-                "SUCCESS", "FAILED", "CANCELLED", "PARTIALLY_EXECUTED"
-            ):
+            if state.get("order_status") in terminal:
                 return state
+
+            # If WS is down, poll REST directly
+            if not self._ws_alive:
+                rest_state = self._poll_order_rest(order_id)
+                if rest_state.get("order_status") in terminal:
+                    self.order_states[order_id] = rest_state
+                    return rest_state
+
             time.sleep(0.5)
+
+        # Final check — return whatever we have
         return self.order_states.get(order_id, {})

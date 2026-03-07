@@ -22,6 +22,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Log outbound IP on boot so you can register it on INDstocks
+import requests as _req
+try:
+    _ip = _req.get("https://api.ipify.org", timeout=5).text
+    logger.info(f"🌐 Outbound IP: {_ip}")
+except Exception:
+    logger.warning("Could not detect outbound IP")
+# ─────────────────────────────────────────────────────────────
+
 # ── Config ────────────────────────────────────────────────────
 INTERVAL       = "15minute"
 MARKET_OPEN    = "09:15"
@@ -66,6 +75,32 @@ def get_trainer(cfg: dict) -> AutoTrainer:
                 logger.info(f"🧠 Trainer created for {cfg['name']}")
                 time.sleep(1.0)
     return trainers[key]
+
+# ── Token Refresh ─────────────────────────────────────────────
+
+def refresh_token():
+    """
+    Fires every morning at 06:30 — 30 min after the 6AM token reset.
+    Sends a Telegram alert with Render-specific instructions.
+    On Render, updating the env var triggers an auto-redeploy
+    which boots the bot fresh with the new token.
+    No polling needed — the redeploy handles everything.
+    """
+    logger.info("🔑 Daily token refresh alert sending...")
+    notifier.send(
+        "🔑 *Action Required: Daily Token Refresh*\n\n"
+        "INDstocks token expired at 6AM.\n\n"
+        "1️⃣ Open INDstocks → Algo Access → New Token\n"
+        "2️⃣ Copy the new token\n"
+        "3️⃣ Open Render → tradingbot → Environment\n"
+        "4️⃣ Update `INDSTOCKS_TOKEN` → Save Changes\n"
+        "5️⃣ Render redeploys automatically in ~60 sec\n\n"
+        "⏰ Complete before 9:15AM market open"
+    )
+    logger.info(
+        "🔑 Token refresh alert sent via Telegram. "
+        "Update INDSTOCKS_TOKEN in Render Environment to redeploy."
+    )
 
 # ── WebSocket Price Feed ──────────────────────────────────────
 
@@ -118,6 +153,14 @@ def run_cycle():
 
     if notifier.bot_paused:
         logger.info("Bot paused via Telegram.")
+        return
+
+    # Block trading if token is known invalid
+    if not api.is_token_valid():
+        logger.warning(
+            "⚠️ Token invalid — skipping cycle. "
+            "Update INDSTOCKS_TOKEN in Render Environment."
+        )
         return
 
     active = scanner.get_active()
@@ -399,6 +442,7 @@ if __name__ == "__main__":
     # Step 7: Schedule all jobs
     schedule.every(60).seconds.do(run_cycle)
     schedule.every(30).minutes.do(refresh_ws_subscriptions)
+    schedule.every().day.at("06:30").do(refresh_token)
     schedule.every().day.at("09:14").do(daily_reset)
     schedule.every().day.at(SQUAREOFF_AT).do(square_off_all)
     schedule.every().day.at("15:30").do(send_daily_summary)
@@ -410,8 +454,6 @@ if __name__ == "__main__":
     logger.info("✅ All systems running — scanning full NSE market")
 
     # Step 9: Wait 3 minutes for initial model training to settle
-    # before the first live cycle fires, avoiding API rate limit
-    # collision between trainer data fetches and live candle fetches
     logger.info("⏳ Waiting 3 minutes for initial model training...")
     time.sleep(180)
 

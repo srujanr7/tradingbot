@@ -72,10 +72,13 @@ class TelegramNotifier:
             "/resume    → resume trading\n"
             "/pause 30  → pause for 30 mins\n\n"
             "<b>💰 Risk Controls</b>\n"
-            "/setlimit 5000  → max ₹ per trade\n"
-            "/setdaily 3000  → max daily loss ₹\n"
-            "/setslots 3 2   → equity/FNO slots\n"
-            "/settrades 10   → max trades/day\n\n"
+            "/setmode MIS     → intraday trading\n"
+            "/setmode CNC     → delivery trading\n"
+            "/setcapital 2000 → limit capital ₹\n"
+            "/setlimit 5000   → max ₹ per trade\n"
+            "/setdaily 3000   → max daily loss ₹\n"
+            "/setslots 3 2    → equity/FNO slots\n"
+            "/settrades 10    → max trades/day\n\n"
             "Send /help anytime for full list"
         )
 
@@ -204,8 +207,8 @@ class TelegramNotifier:
             "Action  : Trading paused\n"
             f"Time    : {self._now()}\n\n"
             "1️⃣ INDstocks → Algo Access → New Token\n"
-            "2️⃣ Render → Environment → Update INDSTOCKS_TOKEN\n"
-            "3️⃣ Render auto-redeploys in ~60s"
+            "2️⃣ SSH into VM → run update_token.sh\n"
+            "3️⃣ Bot restarts automatically"
         )
 
     def daily_summary(self, total_pnl: float, trades: int,
@@ -289,6 +292,10 @@ class TelegramNotifier:
                 "/resume          → resume trading\n"
                 "/pause 30        → pause for N minutes\n\n"
                 "<b>💰 Risk Controls</b>\n"
+                "/setmode MIS     → intraday trading\n"
+                "/setmode CNC     → delivery trading\n"
+                "/setcapital 2000 → limit capital to ₹2,000\n"
+                "/setcapital 0    → remove capital limit\n"
                 "/setlimit 5000   → max ₹ per trade\n"
                 "/setlimit 0      → remove trade limit\n"
                 "/setdaily 3000   → max daily loss ₹\n"
@@ -306,6 +313,8 @@ class TelegramNotifier:
                 "📊 <b>BOT STATUS</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"Mode      : {'⏸ Paused' if self.bot_paused else '✅ Live'}\n"
+                f"Trade Mode: {ref.TRADE_MODE} "
+                f"{'(intraday)' if ref.TRADE_MODE == 'MIS' else '(delivery)'}\n"
                 f"Positions : {st['open_positions']} open\n"
                 f"Equity    : {st['equity_open']}/{ref.MAX_EQUITY_POS} slots\n"
                 f"FNO       : {st['fno_open']}/{ref.MAX_FNO_POS} slots\n"
@@ -326,9 +335,14 @@ class TelegramNotifier:
             st    = ref.posmgr.status()
             pt    = ref.risk.per_trade_limit
             dc    = ref.risk.daily_loss_cap
+            tc    = ref.TRADE_CAPITAL
             self._send(
                 "💰 <b>RISK DASHBOARD</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Trade Mode       : {ref.TRADE_MODE} "
+                f"{'(intraday)' if ref.TRADE_MODE == 'MIS' else '(delivery)'}\n"
+                f"Capital Limit    : "
+                f"{'₹' + f'{tc:,.0f}' if tc else 'No limit (use all)'}\n"
                 f"Daily Loss Limit : ₹{limit:,.0f}"
                 f" {'(custom)' if dc else '(3% auto)'}\n"
                 f"Daily Loss Used  : ₹{used:,.0f} ({pct:.0f}%)\n"
@@ -421,6 +435,60 @@ class TelegramNotifier:
                 )
             threading.Thread(target=_auto_resume, daemon=True).start()
 
+        # ── /setmode <MIS|CNC> ────────────────────────────
+        elif cmd == "/setmode":
+            if not args:
+                self._send(
+                    "Usage: <code>/setmode MIS</code> or <code>/setmode CNC</code>\n\n"
+                    "MIS = intraday (same day, uses eq_mis balance)\n"
+                    "CNC = delivery (hold overnight, uses eq_cnc balance)"
+                )
+                return
+            mode = args[0].upper()
+            if mode not in ("MIS", "CNC"):
+                self._send(
+                    "❌ Invalid.\n"
+                    "Use <code>/setmode MIS</code> or <code>/setmode CNC</code>"
+                )
+                return
+            ref.TRADE_MODE = mode
+            bal = ref.get_balance("EQUITY")
+            self._send(
+                f"✅ <b>Trade mode set to {mode}</b>\n"
+                f"{'Intraday — positions auto-closed by 3:10PM' if mode == 'MIS' else 'Delivery — positions held overnight'}\n"
+                f"Available balance : ₹{bal:,.0f}"
+            )
+
+        # ── /setcapital <amount> ──────────────────────────
+        elif cmd == "/setcapital":
+            if not args:
+                self._send(
+                    "Usage: <code>/setcapital 2000</code>\n"
+                    "Limits total capital the bot can use.\n"
+                    "Use <code>/setcapital 0</code> to use all available funds."
+                )
+                return
+            try:
+                amount = float(args[0])
+                if amount <= 0:
+                    ref.TRADE_CAPITAL = None
+                    self._send(
+                        "✅ Capital limit <b>removed</b>\n"
+                        "Bot will use all available funds."
+                    )
+                else:
+                    ref.TRADE_CAPITAL = amount
+                    self._send(
+                        f"✅ <b>Capital limit set to ₹{amount:,.0f}</b>\n"
+                        f"Bot will only deploy up to ₹{amount:,.0f} "
+                        f"regardless of available balance."
+                    )
+            except ValueError:
+                self._send(
+                    "❌ Invalid amount.\n"
+                    "Usage: <code>/setcapital 2000</code>"
+                )
+
         # ── /setlimit <amount> ────────────────────────────
         elif cmd == "/setlimit":
             if not args:
@@ -441,11 +509,11 @@ class TelegramNotifier:
                 else:
                     ref.risk.per_trade_limit = amount
                     self._send(
-                        "✅ <b>Per-trade limit set</b>\n"
-                        f"Max spend per trade : ₹{amount:,.0f}\n"
+                        f"✅ <b>Per-trade limit set to ₹{amount:,.0f}</b>\n"
+                        f"No single trade will exceed ₹{amount:,.0f}.\n"
                         "Takes effect on next cycle."
                     )
-            except (ValueError, AttributeError):
+            except ValueError:
                 self._send(
                     "❌ Invalid amount.\n"
                     "Usage: <code>/setlimit 5000</code>"
@@ -471,11 +539,11 @@ class TelegramNotifier:
                 else:
                     ref.risk.daily_loss_cap = amount
                     self._send(
-                        "✅ <b>Daily loss cap set</b>\n"
-                        f"Bot stops if loss hits : ₹{amount:,.0f}\n"
+                        f"✅ <b>Daily loss cap set to ₹{amount:,.0f}</b>\n"
+                        f"Bot stops trading if loss hits ₹{amount:,.0f} today.\n"
                         "Takes effect immediately."
                     )
-            except (ValueError, AttributeError):
+            except ValueError:
                 self._send(
                     "❌ Invalid amount.\n"
                     "Usage: <code>/setdaily 3000</code>"
@@ -497,11 +565,11 @@ class TelegramNotifier:
                 ref.MAX_EQUITY_POS    = eq
                 ref.MAX_FNO_POS       = fno
                 self._send(
-                    "✅ <b>Position slots updated</b>\n"
+                    f"✅ <b>Position slots updated</b>\n"
                     f"Equity : max {eq} open positions\n"
                     f"FNO    : max {fno} open positions"
                 )
-            except (ValueError, AttributeError):
+            except ValueError:
                 self._send(
                     "❌ Invalid.\n"
                     "Usage: <code>/setslots 3 2</code>"
@@ -522,7 +590,7 @@ class TelegramNotifier:
                     f"✅ <b>Max trades/day set to {n}</b>\n"
                     f"Used so far today : {ref.risk.trades_today}"
                 )
-            except (ValueError, AttributeError):
+            except ValueError:
                 self._send(
                     "❌ Invalid.\n"
                     "Usage: <code>/settrades 10</code>"

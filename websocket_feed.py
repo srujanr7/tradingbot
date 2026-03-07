@@ -97,7 +97,7 @@ class OrderFeed:
     Streams real-time order status updates.
     Falls back to REST polling if WebSocket is unavailable.
     """
-    WS_URL = "wss://ws-order-updates.indstocks.com/api/v1/ws/orders"
+    WS_URL = "wss://ws-order-updates.indstocks.com"
 
     def __init__(self, on_update=None):
         self.on_update    = on_update

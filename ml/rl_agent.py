@@ -33,20 +33,18 @@ class TradingEnv(gym.Env):
         self.entry_step    = 0
         self.total_pnl     = 0.0
 
-        self.action_space = spaces.Discrete(3)  # 0=HOLD 1=BUY 2=SELL
+        self.action_space = spaces.Discrete(3)
 
-        # 15 price features + 5 memory features = 20 total
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(20,), dtype=np.float32
         )
 
     def _get_memory_features(self) -> list:
-        """Extract learnings from past trades for this instrument."""
         if self.trade_history is None or len(self.trade_history) == 0:
             return [0.0, 0.0, 0.5, 0.0, 0.0]
 
-        th = self.trade_history
+        th       = self.trade_history
         wins     = len(th[th["outcome"] == "WIN"])
         total    = len(th)
         win_rate = wins / total if total > 0 else 0.5
@@ -54,7 +52,6 @@ class TradingEnv(gym.Env):
         avg_hold = th["hold_minutes"].mean() / 240 if total > 0 else 0.5
         best     = th["pnl_pct"].max() if total > 0 else 0.0
         worst    = th["pnl_pct"].min() if total > 0 else 0.0
-
         return [win_rate, avg_pnl, avg_hold, best / 10, worst / 10]
 
     def _get_obs(self) -> np.ndarray:
@@ -76,7 +73,7 @@ class TradingEnv(gym.Env):
             row.get("roc", 0) / 10,
             self.position,
             float(self.sentiment),
-            *mem   # 5 memory features
+            *mem
         ], dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -94,23 +91,22 @@ class TradingEnv(gym.Env):
 
         if action == 1 and self.position == 0:
             # BUY
-            self.position  = 1
-            self.entry     = price
+            self.position   = 1
+            self.entry      = price
             self.entry_step = self.current
             reward          = -0.001
 
         elif action == 2 and self.position == 1:
-            # SELL — calculate reward
-            pnl_pct      = (price - self.entry) / self.entry
-            hold_minutes = (self.current - self.entry_step) * 15
-            reward       = _reward_e.calculate(
-                pnl      = (price - self.entry),
-                pnl_pct  = pnl_pct,
-                hold_minutes = hold_minutes,
-                confidence   = 0.7,
-                sentiment    = self.sentiment
+            # SELL — use new RewardEngine signature
+            held_candles = self.current - self.entry_step
+            reward = _reward_e.calculate(
+                entry            = self.entry,
+                exit_price       = price,
+                held_candles     = held_candles,
+                signal           = {"regime": "NEUTRAL"},
+                max_drawdown_pct = 0.0
             )
-            self.total_pnl += pnl_pct
+            self.total_pnl += (price - self.entry) / self.entry
             self.position   = 0
             self.entry      = 0.0
 
@@ -128,14 +124,13 @@ class RLEnsemble:
     """
     Ensemble of PPO + A2C agents.
     Both train continuously and vote on signals.
-    The better-performing model gets more weight.
     """
 
     def __init__(self, scrip_code: str):
         self.scrip_code = scrip_code
         self.ppo        = None
         self.a2c        = None
-        self.ppo_score  = 0.5   # running win rate
+        self.ppo_score  = 0.5
         self.a2c_score  = 0.5
         os.makedirs(MODELS_DIR, exist_ok=True)
         self._load()
@@ -144,7 +139,6 @@ class RLEnsemble:
         return f"{MODELS_DIR}/{algo}_{self.scrip_code}"
 
     def _load(self):
-        """Load saved models if they exist."""
         try:
             if os.path.exists(f"{self._path('ppo')}.zip"):
                 self.ppo = PPO.load(self._path("ppo"))
@@ -163,17 +157,19 @@ class RLEnsemble:
               sentiment: float = 0.0,
               trade_history: pd.DataFrame = None,
               timesteps: int = 10000):
-        """Train both PPO and A2C. Called after market close."""
         if len(df) < 50:
-            logger.warning(f"Not enough data for RL training: {self.scrip_code}")
+            logger.warning(
+                f"Not enough data for RL training: {self.scrip_code}"
+            )
             return
 
-        logger.info(f"🧠 Training RL ensemble for {self.scrip_code}...")
+        logger.info(
+            f"🧠 Training RL ensemble for {self.scrip_code}..."
+        )
 
         def make_env():
             return TradingEnv(df, sentiment, trade_history)
 
-        # Train PPO
         try:
             env = DummyVecEnv([make_env])
             if self.ppo is None:
@@ -190,11 +186,12 @@ class RLEnsemble:
                 self.ppo.set_env(env)
             self.ppo.learn(total_timesteps=timesteps)
             self.ppo.save(self._path("ppo"))
-            logger.info(f"✅ PPO trained & saved for {self.scrip_code}")
+            logger.info(
+                f"✅ PPO trained & saved for {self.scrip_code}"
+            )
         except Exception as e:
             logger.error(f"PPO training error: {e}")
 
-        # Train A2C
         try:
             env = DummyVecEnv([make_env])
             if self.a2c is None:
@@ -209,14 +206,15 @@ class RLEnsemble:
                 self.a2c.set_env(env)
             self.a2c.learn(total_timesteps=timesteps)
             self.a2c.save(self._path("a2c"))
-            logger.info(f"✅ A2C trained & saved for {self.scrip_code}")
+            logger.info(
+                f"✅ A2C trained & saved for {self.scrip_code}"
+            )
         except Exception as e:
             logger.error(f"A2C training error: {e}")
 
     def predict(self, df: pd.DataFrame,
                 sentiment: float = 0.0,
                 trade_history: pd.DataFrame = None) -> dict:
-        """Ensemble vote from PPO + A2C."""
         signal_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
         votes      = {"BUY": 0.0, "SELL": 0.0, "HOLD": 0.0}
 
@@ -228,7 +226,9 @@ class RLEnsemble:
             try:
                 obs, _ = env.reset()
                 for _ in range(min(len(df) - 1, 30)):
-                    action, _ = model.predict(obs, deterministic=True)
+                    action, _ = model.predict(
+                        obs, deterministic=True
+                    )
                     obs, _, done, _, _ = env.step(int(action))
                     if done:
                         break
@@ -241,27 +241,20 @@ class RLEnsemble:
         run_model(self.ppo, self.ppo_score)
         run_model(self.a2c, self.a2c_score)
 
-        # Pick signal with most weight
-        final  = max(votes, key=votes.get)
-        total  = sum(votes.values())
-        conf   = votes[final] / total if total > 0 else 0.0
+        final = max(votes, key=votes.get)
+        total = sum(votes.values())
+        conf  = votes[final] / total if total > 0 else 0.0
 
         return {
             "signal":     final,
             "confidence": round(conf, 3),
-            "ppo_vote":   signal_map.get(0, "HOLD"),
-            "a2c_vote":   signal_map.get(0, "HOLD"),
             "votes":      votes
         }
 
-    def update_scores(self, pnl_pct: float, ppo_was_right: bool,
+    def update_scores(self, pnl_pct: float,
+                      ppo_was_right: bool,
                       a2c_was_right: bool):
-        """
-        Update model scores based on trade outcome.
-        Better performing model gets more weight next time.
-        """
-        alpha = 0.1   # learning rate for score update
-
+        alpha = 0.1
         if ppo_was_right:
             self.ppo_score = min(1.0, self.ppo_score + alpha)
         else:

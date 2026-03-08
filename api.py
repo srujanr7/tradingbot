@@ -221,10 +221,41 @@ class INDstocksAPI:
         data = self._request("GET", "/funds")
         return data["data"] if data else {}
 
+    def get_true_balance(self, trade_mode: str = "MIS") -> float:
+        """
+        Returns the single real balance for the given trade mode.
+        This is the ACTUAL cash available — never add segments together,
+        they all represent the same underlying money split differently.
+
+        MIS    → eq_mis   (intraday equity, includes broker leverage)
+        CNC    → eq_cnc   (delivery equity, no leverage)
+        MTF    → eq_mtf   (margin trading facility)
+        MARGIN → future   (F&O margin)
+        """
+        funds = self.get_funds()
+        if not funds:
+            return 0.0
+        avl = funds.get("detailed_avl_balance", {})
+        mapping = {
+            "MIS":    avl.get("eq_mis",     0.0),
+            "CNC":    avl.get("eq_cnc",     0.0),
+            "MTF":    avl.get("eq_mtf",     0.0),
+            "MARGIN": avl.get("future",     0.0),
+        }
+        return float(mapping.get(trade_mode.upper(), avl.get("eq_mis", 0.0)))
+
     def check_margin(self, security_id, qty, price,
                      segment="EQUITY", txn_type="BUY",
-                     product="CNC"):
-        """Check margin before placing order."""
+                     product="CNC", exchange="NSE"):
+        """
+        Check margin required before placing order.
+        Returns full margin dict from broker or None on failure.
+
+        Key field: data["total_margin"] — actual funds needed for this order.
+        This accounts for broker leverage automatically, so:
+          total_margin < cash_balance → order will go through
+          total_margin > cash_balance → insufficient margin
+        """
         data = self._request(
             "GET", "/margin",
             json={
@@ -233,8 +264,71 @@ class INDstocksAPI:
                 "quantity":   str(qty),
                 "price":      str(price),
                 "product":    product,
-                "securityID": security_id,
-                "exchange":   "NSE"
+                "securityID": str(security_id),
+                "exchange":   exchange
             }
         )
-        return data["data"] if data else None
+        if data and data.get("status") == "success":
+            return data["data"]
+        return None
+
+    @staticmethod
+    def _api_product(trade_mode: str, segment: str = "EQUITY") -> str:
+        """
+        Converts internal TRADE_MODE → API product string.
+
+        The INDstocks margin and order API does NOT accept "MIS" —
+        it requires "INTRADAY". This mapping handles all modes:
+
+        TRADE_MODE   segment      → API product
+        ──────────────────────────────────────────
+        MIS          EQUITY       → INTRADAY
+        CNC          EQUITY       → CNC
+        MTF          EQUITY       → CNC
+        MARGIN       DERIVATIVE   → MARGIN
+        anything     DERIVATIVE   → MARGIN
+        """
+        mode = (trade_mode or "MIS").upper()
+        seg  = (segment or "EQUITY").upper()
+
+        if seg == "DERIVATIVE":
+            return "MARGIN"
+
+        return {
+            "MIS":    "INTRADAY",
+            "CNC":    "CNC",
+            "MTF":    "CNC",
+            "MARGIN": "MARGIN",
+        }.get(mode, "INTRADAY")
+
+    def get_margin_per_unit(self, security_id, price,
+                             segment="EQUITY", txn_type="BUY",
+                             product="MIS", exchange="NSE") -> float:
+        """
+        Returns margin required for a SINGLE unit of this instrument.
+        Use this to calculate max affordable quantity:
+            max_qty = available_balance / margin_per_unit
+
+        For MIS equity: margin_per_unit = price / leverage_multiplier
+        For MARGIN (F&O): margin_per_unit = SPAN + exposure margin per unit
+        Returns 0.0 on failure (caller should fallback to price).
+        """
+        api_product = self._api_product(product, segment)  # MIS → INTRADAY
+
+        margin = self.check_margin(
+            security_id = security_id,
+            qty         = 1,
+            price       = price,
+            segment     = segment,
+            txn_type    = txn_type,
+            product     = api_product,
+            exchange    = exchange
+        )
+        if margin:
+            total = float(margin.get("total_margin", 0.0))
+            logger.debug(
+                f"Margin/unit [{security_id}] @ ₹{price} "
+                f"({product}→{api_product}): ₹{total:.2f}"
+            )
+            return total
+        return 0.0

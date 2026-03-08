@@ -39,6 +39,15 @@ MAX_EQUITY_POS = config.MAX_EQUITY_POS
 MAX_FNO_POS    = config.MAX_FNO_POS
 MIN_CONFIDENCE = config.TRADE_CONFIDENCE
 
+# ── Segment / Exchange / Instrument filters ───────────────────
+# Controllable live via Telegram:
+#   /setsegment    EQUITY | FNO | BOTH
+#   /setexchange   NSE | BSE | BOTH
+#   /setinstrument EQUITY | FUTURES | OPTIONS | ALL
+ACTIVE_SEGMENT    = "BOTH"   # EQUITY | FNO | BOTH
+ACTIVE_EXCHANGE   = "BOTH"   # NSE | BSE | BOTH
+ACTIVE_INSTRUMENT = "ALL"    # EQUITY | FUTURES | OPTIONS | ALL
+
 # ── Core services ─────────────────────────────────────────────
 api      = INDstocksAPI()
 risk     = RiskManager(
@@ -57,8 +66,6 @@ posmgr      = PositionManager(
 trade_memory = TradeMemory()
 
 # ── India VIX ─────────────────────────────────────────────────
-# Fetched once every morning in daily_reset().
-# Used to gate trading and scale position sizes.
 _vix_data = {
     "vix":        15.0,
     "multiplier": 1.0,
@@ -69,32 +76,19 @@ _vix_data = {
 
 
 def get_india_vix() -> dict:
-    """
-    Fetches India VIX from NSE public API.
-    Called once every morning at daily_reset (09:14).
-    Also called at boot so first cycle has real data.
-
-    Returns:
-        vix        — current VIX value
-        safe       — VIX < 20, trade normally
-        half_size  — VIX 20–24, halve position sizes
-        stop_trade — VIX >= 25, do not trade at all
-        multiplier — position size factor (0.0 / 0.5 / 1.0)
-    """
+    """Fetches India VIX from NSE. Called at boot + daily reset."""
     try:
         r = _req.get(
             "https://www.nseindia.com/api/allIndices",
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept":     "application/json",
-            },
+            headers={"User-Agent": "Mozilla/5.0",
+                     "Accept": "application/json"},
             timeout=5,
         )
         vix = next(
             (float(i["last"])
              for i in r.json().get("data", [])
              if i.get("index") == "INDIA VIX"),
-            15.0,   # safe default if index not found
+            15.0,
         )
         return {
             "vix":        vix,
@@ -108,12 +102,9 @@ def get_india_vix() -> dict:
             ),
         }
     except Exception as e:
-        logger.warning(f"VIX fetch failed: {e} — assuming safe (VIX=15)")
-        return {
-            "vix": 15.0, "safe": True,
-            "half_size": False, "stop_trade": False,
-            "multiplier": 1.0,
-        }
+        logger.warning(f"VIX fetch failed: {e} — assuming safe")
+        return {"vix": 15.0, "safe": True, "half_size": False,
+                "stop_trade": False, "multiplier": 1.0}
 
 
 # ── ML Trainers ───────────────────────────────────────────────
@@ -226,6 +217,35 @@ def _interval_minutes(interval: str) -> int:
     return mapping.get(interval, 5)
 
 
+def _passes_filters(cfg: dict) -> tuple:
+    """
+    Checks ACTIVE_SEGMENT, ACTIVE_EXCHANGE, ACTIVE_INSTRUMENT
+    against the instrument config dict.
+    Returns (passes: bool, reason: str).
+    """
+    seg       = cfg.get("segment", "EQUITY")
+    exchange  = cfg.get("exchange", "NSE")
+    inst_type = cfg.get("instrument_type", "EQUITY")
+
+    if ACTIVE_SEGMENT == "EQUITY" and seg != "EQUITY":
+        return False, f"segment filter active (EQUITY only, got {seg})"
+    if ACTIVE_SEGMENT == "FNO" and seg != "DERIVATIVE":
+        return False, f"segment filter active (FNO only, got {seg})"
+
+    if ACTIVE_EXCHANGE == "NSE" and exchange != "NSE":
+        return False, f"exchange filter active (NSE only, got {exchange})"
+    if ACTIVE_EXCHANGE == "BSE" and exchange != "BSE":
+        return False, f"exchange filter active (BSE only, got {exchange})"
+
+    if ACTIVE_INSTRUMENT != "ALL" and inst_type != ACTIVE_INSTRUMENT:
+        return False, (
+            f"instrument filter active ({ACTIVE_INSTRUMENT} only, "
+            f"got {inst_type})"
+        )
+
+    return True, ""
+
+
 # ── SL/TP Monitor — runs first every cycle ────────────────────
 
 def _monitor_open_positions(active: list):
@@ -276,10 +296,10 @@ def _monitor_open_positions(active: list):
             trail_exit = t_info["exit_now"]
             locked_pnl = t_info.get("locked_pnl", 0.0)
 
-        hard_sl   = ltp <= stop_loss
-        tp_hit    = ltp >= take_profit
+        hard_sl  = ltp <= stop_loss
+        tp_hit   = ltp >= take_profit
 
-        opened_at    = datetime.fromisoformat(
+        opened_at = datetime.fromisoformat(
             pos.get("opened_at", datetime.now().isoformat())
         )
         held_minutes = (
@@ -317,11 +337,10 @@ def run_cycle():
         logger.warning("⚠️ Token invalid — skipping cycle.")
         return
 
-    # ── VIX gate — stop trading on panic days ─────────────────
+    # VIX gate
     if _vix_data["stop_trade"]:
         logger.info(
-            f"🔴 VIX {_vix_data['vix']:.1f} ≥ 25 "
-            f"— trading paused for safety"
+            f"🔴 VIX {_vix_data['vix']:.1f} ≥ 25 — trading paused"
         )
         return
 
@@ -330,7 +349,6 @@ def run_cycle():
         logger.warning("No active instruments.")
         return
 
-    # SL/TP monitoring runs first — protect capital
     _monitor_open_positions(active)
 
     signals      = []
@@ -338,6 +356,14 @@ def run_cycle():
 
     def scan_instrument(cfg):
         try:
+            # Filter check — runs on every instrument
+            passes, filter_reason = _passes_filters(cfg)
+            if not passes:
+                logger.debug(
+                    f"[{cfg['name']}] Filtered — {filter_reason}"
+                )
+                return
+
             if posmgr.has_position(cfg["scrip_code"]):
                 token = cfg["ws_token"].split(":")[1]
                 ltp   = price_feed.get_ltp(token)
@@ -460,6 +486,15 @@ def run_cycle():
 # ── Entry ─────────────────────────────────────────────────────
 
 def process_entry(cfg: dict, result: dict, ltp: float):
+
+    # Segment / exchange / instrument filter (hard gate)
+    passes, filter_reason = _passes_filters(cfg)
+    if not passes:
+        logger.info(
+            f"[{cfg['name']}] Entry blocked — {filter_reason}"
+        )
+        return
+
     effective_segment = (
         "DERIVATIVE" if TRADE_MODE == "MARGIN"
         else cfg["segment"]
@@ -476,7 +511,6 @@ def process_entry(cfg: dict, result: dict, ltp: float):
     if risk.daily_pnl < -(limit * 0.8):
         notifier.risk_warning(risk.daily_pnl, limit, balance)
 
-    # ── Fully automatic sizing — Kelly first, confidence fallback
     qty = posmgr.position_size(
         balance    = balance,
         price      = ltp,
@@ -487,10 +521,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
     )
     qty = risk.apply_per_trade_limit(qty, ltp)
 
-    # ── VIX position size scaling ─────────────────────────────
-    # half_size (VIX 20-24): multiply qty by 0.5
-    # stop_trade (VIX >= 25): already gated in run_cycle(),
-    #   but multiplier=0.0 acts as a safety net here too
+    # VIX position size scaling
     if _vix_data["multiplier"] < 1.0:
         original_qty = qty
         qty = max(1, int(qty * _vix_data["multiplier"]))
@@ -539,7 +570,6 @@ def process_entry(cfg: dict, result: dict, ltp: float):
             )
             return
 
-        # ATR-based SL/TP — prefer signal levels, fall back fixed
         stop_loss   = result.get("stop_loss")  or round(avg_price * 0.99, 2)
         take_profit = result.get("take_profit") or round(avg_price * 1.02, 2)
         atr_val     = result.get("atr") or avg_price * 0.01
@@ -631,8 +661,7 @@ def process_exit(cfg: dict, ltp: float,
 
         meta = pos.get("signal_meta", {})
 
-        # Held candles calculation
-        opened_at    = datetime.fromisoformat(
+        opened_at = datetime.fromisoformat(
             pos.get("opened_at", datetime.now().isoformat())
         )
         held_minutes = (
@@ -647,7 +676,6 @@ def process_exit(cfg: dict, ltp: float,
             1, int(held_minutes / _interval_minutes(interval_key))
         )
 
-        # Feedback loop
         trainer = trainers.get(cfg["scrip_code"])
         if trainer:
             trainer.record_trade_outcome(
@@ -662,7 +690,6 @@ def process_exit(cfg: dict, ltp: float,
                 signal_meta      = meta,
             )
 
-        # Persist full trade record
         trade_memory.record({
             "scrip_code":       cfg["scrip_code"],
             "name":             cfg["name"],
@@ -693,6 +720,8 @@ def process_exit(cfg: dict, ltp: float,
             "ev_quality":       meta.get("ev_quality", ""),
             "interval":         interval_key,
             "vix":              _vix_data["vix"],
+            "exchange":         cfg.get("exchange", ""),
+            "instrument_type":  cfg.get("instrument_type", "EQUITY"),
         })
 
         notifier.trade_closed(
@@ -728,15 +757,9 @@ def square_off_all():
 
 
 def daily_reset():
-    """
-    Runs every morning before market open.
-    Resets daily PnL counters, fetches fresh VIX,
-    and pauses/warns if VIX is elevated.
-    """
     global _vix_data
     risk.reset_daily()
 
-    # Fetch today's VIX and act on it
     _vix_data = get_india_vix()
     logger.info(
         f"🌡️ India VIX: {_vix_data['vix']:.1f} | "
@@ -751,22 +774,20 @@ def daily_reset():
             f"Threshold : 25.0\n"
             f"Reason    : Extreme market fear\n"
             f"Action    : Bot will NOT trade today\n\n"
-            f"Send /resume to override if you want to trade."
+            f"Send /resume to override."
         )
         notifier.bot_paused = True
-
     elif _vix_data["half_size"]:
         notifier.send(
             f"⚠️ <b>VIX WARNING — Reduced Sizes</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"India VIX  : {_vix_data['vix']:.1f}\n"
-            f"Threshold  : 20.0\n"
-            f"Action     : All position sizes halved today\n"
-            f"Trading    : Continues with caution"
+            f"Action     : All position sizes halved today"
         )
-
     else:
-        logger.info(f"VIX normal ({_vix_data['vix']:.1f}) — full size trading")
+        logger.info(
+            f"VIX normal ({_vix_data['vix']:.1f}) — full size trading"
+        )
 
     logger.info("🔄 Daily counters reset")
 
@@ -778,7 +799,8 @@ def send_daily_summary():
         total_pnl = risk.daily_pnl,
         trades    = risk.trades_today,
         wins      = status["win_count"],
-        balance   = balance
+        balance   = balance,
+        vix       = _vix_data["vix"],
     )
 
 
@@ -812,16 +834,13 @@ if __name__ == "__main__":
     order_feed.start()
     time.sleep(2)
 
-    # Fetch VIX at boot so first cycle has real data
     _vix_data = get_india_vix()
     logger.info(
         f"🌡️ Boot VIX check: {_vix_data['vix']:.1f} | "
         f"{'✅ Safe' if _vix_data['safe'] else '⚠️ Caution' if _vix_data['half_size'] else '🔴 STOP TRADING'}"
     )
     if _vix_data["stop_trade"]:
-        logger.warning(
-            "🔴 VIX >= 25 at boot — bot will not trade today"
-        )
+        logger.warning("🔴 VIX >= 25 at boot — bot will not trade today")
         notifier.send(
             f"🔴 <b>Bot started but VIX = {_vix_data['vix']:.1f}</b>\n"
             f"Trading paused. Send /resume to override."
@@ -831,9 +850,7 @@ if __name__ == "__main__":
     scanner.start_background_refresh()
     notifier.start_command_listener(bot_ref=sys.modules[__name__])
 
-    schedule.every(config.CYCLE_INTERVAL_SECONDS).seconds.do(
-        run_cycle
-    )
+    schedule.every(config.CYCLE_INTERVAL_SECONDS).seconds.do(run_cycle)
     schedule.every(30).minutes.do(refresh_ws_subscriptions)
     schedule.every().day.at("06:30").do(refresh_token)
     schedule.every().day.at(config.DAILY_RESET_AT).do(daily_reset)

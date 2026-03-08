@@ -40,10 +40,6 @@ MAX_FNO_POS    = config.MAX_FNO_POS
 MIN_CONFIDENCE = config.TRADE_CONFIDENCE
 
 # ── Segment / Exchange / Instrument filters ───────────────────
-# Controllable live via Telegram:
-#   /setsegment    EQUITY | FNO | BOTH
-#   /setexchange   NSE | BSE | BOTH
-#   /setinstrument EQUITY | FUTURES | OPTIONS | ALL
 ACTIVE_SEGMENT    = "BOTH"   # EQUITY | FNO | BOTH
 ACTIVE_EXCHANGE   = "BOTH"   # NSE | BSE | BOTH
 ACTIVE_INSTRUMENT = "ALL"    # EQUITY | FUTURES | OPTIONS | ALL
@@ -184,22 +180,18 @@ def get_candles(cfg: dict):
 
 
 def get_balance(segment: str) -> float:
-    funds = api.get_funds()
-    if not funds:
-        return 0.0
-    avl = funds.get("detailed_avl_balance", {})
-    if segment == "EQUITY":
-        if TRADE_MODE == "MIS":
-            raw = avl.get("eq_mis", 0.0)
-        elif TRADE_MODE == "MTF":
-            raw = avl.get("eq_mtf", 0.0)
-        else:
-            raw = avl.get("eq_cnc", 0.0)
-    elif segment == "DERIVATIVE":
-        raw = avl.get("future", 0.0) if TRADE_MODE == "MARGIN" \
-              else avl.get("option_buy", 0.0)
-    else:
-        raw = 0.0
+    """
+    Returns the true available balance for the current trade mode.
+
+    IMPORTANT: The broker returns the same underlying cash split
+    across multiple fields (eq_mis, future, option_buy etc).
+    These are NOT separate pools of money — never add them together.
+
+    We always use get_true_balance(TRADE_MODE) which picks exactly
+    one field matching the active mode, then caps at TRADE_CAPITAL
+    if the user has set a limit.
+    """
+    raw = api.get_true_balance(TRADE_MODE)
     return min(raw, TRADE_CAPITAL) if TRADE_CAPITAL else raw
 
 
@@ -495,11 +487,8 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         )
         return
 
-    effective_segment = (
-        "DERIVATIVE" if TRADE_MODE == "MARGIN"
-        else cfg["segment"]
-    )
-    balance = get_balance(effective_segment)
+    # ── FIXED: use single true balance, never add segments ──
+    balance = get_balance(cfg["segment"])
 
     if not risk.can_trade(balance):
         notifier.kill_switch(
@@ -511,15 +500,39 @@ def process_entry(cfg: dict, result: dict, ltp: float):
     if risk.daily_pnl < -(limit * 0.8):
         notifier.risk_warning(risk.daily_pnl, limit, balance)
 
+    # ── FIXED: use margin API for real position sizing ──────
+    # Ask broker: how much margin do I need for 1 unit?
+    effective_segment = (
+        "DERIVATIVE" if TRADE_MODE == "MARGIN"
+        else cfg.get("segment", "EQUITY")
+    )
+    margin_per_unit = api.get_margin_per_unit(
+        security_id = cfg["security_id"],
+        price       = ltp,
+        segment     = effective_segment,
+        txn_type    = "BUY",
+        product     = TRADE_MODE,   # _api_product() converts this internally
+        exchange    = cfg.get("exchange", "NSE")
+    )
+
+    # Fallback: if margin API fails, use raw price (no leverage)
+    if margin_per_unit <= 0:
+        logger.warning(
+            f"[{cfg['name']}] Margin API returned 0, "
+            f"falling back to raw price for sizing"
+        )
+        margin_per_unit = ltp
+
+    # Now size using actual margin cost per unit
     qty = posmgr.position_size(
         balance    = balance,
-        price      = ltp,
+        price      = margin_per_unit,   # ← margin per unit, not raw price
         segment    = effective_segment,
         confidence = result["confidence"],
         kelly_pct  = result.get("kelly_pct", 0.0),
         rr_ratio   = result.get("rr_ratio",  0.0),
     )
-    qty = risk.apply_per_trade_limit(qty, ltp)
+    qty = risk.apply_per_trade_limit(qty, margin_per_unit)
 
     # VIX position size scaling
     if _vix_data["multiplier"] < 1.0:
@@ -531,16 +544,32 @@ def process_entry(cfg: dict, result: dict, ltp: float):
             f"(×{_vix_data['multiplier']})"
         )
 
+    # Final margin check: can we actually afford this qty?
     margin = api.check_margin(
-        cfg["security_id"], qty, ltp,
-        segment = effective_segment,
-        product = TRADE_MODE
+        security_id = cfg["security_id"],
+        qty         = qty,
+        price       = ltp,
+        segment     = effective_segment,
+        txn_type    = "BUY",
+        product     = api._api_product(TRADE_MODE, effective_segment),
+        exchange    = cfg.get("exchange", "NSE")
     )
-    if margin and margin["total_margin"] > balance:
-        notifier.insufficient_margin(
-            cfg["name"], margin["total_margin"], balance
+    if margin:
+        required = margin.get("total_margin", 0)
+        if required > balance:
+            notifier.insufficient_margin(
+                cfg["name"], required, balance
+            )
+            logger.warning(
+                f"[{cfg['name']}] Margin check failed: "
+                f"need ₹{required:,.0f}, have ₹{balance:,.0f}"
+            )
+            return
+        logger.info(
+            f"[{cfg['name']}] Margin OK: "
+            f"₹{required:,.0f} / ₹{balance:,.0f} available | "
+            f"Charges: ₹{margin.get('charges', {}).get('total_charges', 0):.2f}"
         )
-        return
 
     order = api.place_order(
         txn_type    = "BUY",
@@ -551,7 +580,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
             ltp * (1 + config.LIMIT_ORDER_SLIPPAGE), 2
         ),
         segment     = effective_segment,
-        product     = TRADE_MODE,
+        product     = api._api_product(TRADE_MODE, effective_segment),
         exchange    = cfg["exchange"]
     )
 
@@ -638,7 +667,7 @@ def process_exit(cfg: dict, ltp: float,
         qty         = pos["qty"],
         order_type  = "MARKET",
         segment     = pos["segment"],
-        product     = TRADE_MODE,
+        product     = api._api_product(TRADE_MODE, pos["segment"]),
         exchange    = cfg["exchange"]
     )
 
@@ -793,8 +822,9 @@ def daily_reset():
 
 
 def send_daily_summary():
+    # ── FIXED: use single true balance, never add segments ──
+    balance = api.get_true_balance(TRADE_MODE)
     status  = posmgr.status()
-    balance = get_balance("EQUITY") + get_balance("DERIVATIVE")
     notifier.daily_summary(
         total_pnl = risk.daily_pnl,
         trades    = risk.trades_today,

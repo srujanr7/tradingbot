@@ -12,7 +12,6 @@ from sklearn.metrics import classification_report
 
 logger = logging.getLogger(__name__)
 
-# Try importing PPO — optional (requires stable-baselines3 + PyTorch)
 try:
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv
@@ -23,13 +22,10 @@ except ImportError:
     logger.warning("stable-baselines3 not installed. Running XGBoost only.")
 
 
-# ── XGBoost Signal Classifier ─────────────────────────────────
-
 class XGBSignalModel:
     """
     Predicts BUY (1) / SELL (0) signal from features.
     Uses TimeSeriesSplit to avoid lookahead bias.
-    Primary model — always runs.
     """
 
     def __init__(self, model_path="ml/xgb_model.pkl"):
@@ -81,18 +77,26 @@ class XGBSignalModel:
         logger.info(f"XGB model trained on {len(X)} samples")
 
     def predict(self, features: pd.DataFrame) -> dict:
-        """
-        Returns signal and confidence.
-        Below 60% confidence always returns HOLD.
-        """
-        if not self.is_trained:
+        """Returns signal and confidence. HOLD if not trained or feature mismatch."""
+        if not self.is_trained or self.feature_cols is None:
             return {"signal": "HOLD", "confidence": 0.0}
 
         try:
+            # Guard: only keep columns the model was trained on
+            available = [c for c in self.feature_cols
+                         if c in features.columns]
+            if len(available) < len(self.feature_cols):
+                missing = set(self.feature_cols) - set(available)
+                logger.warning(
+                    f"XGB predict: missing features {missing}, "
+                    f"returning HOLD"
+                )
+                return {"signal": "HOLD", "confidence": 0.0}
+
             row        = features[self.feature_cols].iloc[[-1]]
             row_sc     = self.scaler.transform(row)
             proba      = self.model.predict_proba(row_sc)[0]
-            confidence = max(proba)
+            confidence = float(max(proba))
             label      = int(self.model.predict(row_sc)[0])
 
             if confidence < 0.60:
@@ -107,6 +111,7 @@ class XGBSignalModel:
             return {"signal": "HOLD", "confidence": 0.0}
 
     def save(self):
+        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         joblib.dump({
             "model":        self.model,
             "scaler":       self.scaler,
@@ -132,18 +137,11 @@ class XGBSignalModel:
             )
 
 
-# ── Trading Environment (Gymnasium) ──────────────────────────
-
 class TradingEnv(gym.Env):
     """
-    Custom Gym environment for Equity and F&O.
-    Always defined since gymnasium is always installed.
-    Only used for training if PPO is available.
-
+    Custom Gym environment for RL trading.
     State:   feature vector + position flag + unrealized PnL
     Actions: 0=Hold, 1=Buy, 2=Sell
-    Reward:  realized PnL % on close,
-             small penalty for holding too long
     """
     metadata = {"render_modes": []}
 
@@ -190,13 +188,11 @@ class TradingEnv(gym.Env):
         reward = 0.0
 
         if action == 1 and self.position == 0:
-            # Buy
             self.position    = 1
             self.entry_price = price
             self.hold_count  = 0
 
         elif action == 2 and self.position == 1:
-            # Sell
             pnl              = (price - self.entry_price) / self.entry_price
             reward           = pnl * 100
             self.balance    *= (1 + pnl)
@@ -205,7 +201,6 @@ class TradingEnv(gym.Env):
             self.hold_count  = 0
 
         elif action == 0 and self.position == 1:
-            # Hold — small penalty for holding too long
             self.hold_count += 1
             reward           = -0.001 * self.hold_count
 
@@ -214,14 +209,10 @@ class TradingEnv(gym.Env):
         return self._obs(), reward, done, False, {}
 
 
-# ── RL Agent ──────────────────────────────────────────────────
-
 class RLAgent:
     """
     PPO Reinforcement Learning agent.
-    Uses stable-baselines3 if installed.
-    Safely returns HOLD (action=0) if not available.
-    No crashes — bot always keeps running.
+    Returns HOLD safely if PPO not available.
     """
 
     def __init__(self, model_path="ml/ppo_model"):
@@ -238,7 +229,6 @@ class RLAgent:
                 "stable-baselines3 not installed"
             )
             return
-
         try:
             env = DummyVecEnv([
                 lambda: TradingEnv(features, prices)
@@ -263,9 +253,6 @@ class RLAgent:
 
     def load(self):
         if not self.available:
-            logger.warning(
-                "RL not available — skipping PPO load"
-            )
             return
         try:
             if os.path.exists(f"{self.model_path}.zip"):
@@ -281,10 +268,6 @@ class RLAgent:
             logger.error(f"PPO load error: {e}")
 
     def predict(self, obs: np.ndarray) -> int:
-        """
-        Returns action: 0=Hold, 1=Buy, 2=Sell
-        Returns 0 (Hold) safely if PPO not available.
-        """
         if not self.available or self.model is None:
             return 0
         try:

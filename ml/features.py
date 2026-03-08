@@ -6,9 +6,8 @@ import ta
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Takes OHLCV dataframe, returns feature matrix.
-    Works for both Equity and F&O candles.
-    Uses the 'ta' library instead of pandas-ta for
-    Python 3.11 compatibility on Render.
+    Index is preserved from df so build_labels() stays aligned.
+    Uses the 'ta' library for Python 3.11 compatibility.
     """
     f = pd.DataFrame(index=df.index)
 
@@ -74,6 +73,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         f["minute"]      = ts.dt.minute
         f["day_of_week"] = ts.dt.dayofweek
 
+    # Drop NaN rows but KEEP the original index intact
+    # so build_labels() called on the same df stays aligned
     return f.dropna()
 
 
@@ -83,7 +84,11 @@ def build_labels(df: pd.DataFrame, horizon: int = 3,
     Label each candle:
       1 = price rises > threshold% in next horizon candles
       0 = price falls > threshold%
-      rows where neither — filtered out during training
+      NaN rows are filtered during training (dropna on merge)
+
+    Called on the ORIGINAL df (before indicators),
+    then aligned to features index inside XGBSignalModel.train()
+    via the dropna() on the merged df.
     """
     future_return = df["close"].shift(-horizon) / df["close"] - 1
     labels        = pd.Series(index=df.index, dtype=float)

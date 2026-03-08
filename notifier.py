@@ -474,8 +474,7 @@ class TelegramNotifier:
         elif cmd == "/risk":
             if not ref:
                 return
-            seg   = "DERIVATIVE" if ref.TRADE_MODE == "MARGIN" else "EQUITY"
-            bal   = ref.get_balance(seg)
+            bal   = ref.get_balance(ref.TRADE_MODE)
             limit = ref.risk.get_daily_limit(bal)
             used  = abs(min(ref.risk.daily_pnl, 0))
             pct   = used / limit * 100 if limit else 0
@@ -505,18 +504,90 @@ class TelegramNotifier:
             if not f:
                 self._send("❌ Could not fetch funds.")
                 return
-            avl = f.get("detailed_avl_balance", {})
+            avl        = f.get("detailed_avl_balance", {})
+            trade_mode = ref.TRADE_MODE
+
+            # Pick the single true balance for the active mode
+            # These fields all represent the same underlying cash
+            # split differently — never add them together
+            mode_balance_map = {
+                "MIS":    ("eq_mis",    "Intraday Equity (MIS)"),
+                "CNC":    ("eq_cnc",    "Delivery Equity (CNC)"),
+                "MTF":    ("eq_mtf",    "Leveraged Delivery (MTF)"),
+                "MARGIN": ("future",    "Futures Margin"),
+            }
+            active_field, active_label = mode_balance_map.get(
+                trade_mode, ("eq_mis", "Intraday Equity (MIS)")
+            )
+            true_balance = float(avl.get(active_field, 0.0))
+            cap_line = (
+                f"\n⚠️ Capped at: ₹{ref.TRADE_CAPITAL:,.2f}"
+                if ref.TRADE_CAPITAL and true_balance > ref.TRADE_CAPITAL
+                else ""
+            )
+
+            # ── Margin / buying power calculation ─────────────
+            # Call /margin API with qty=1 to find margin per unit,
+            # then derive how many units you can afford and total
+            # buying power. Uses RELIANCE (2885) as a reference
+            # instrument since we just want the leverage ratio.
+            margin_line = ""
+            try:
+                seg = (
+                    "DERIVATIVE" if trade_mode == "MARGIN"
+                    else "EQUITY"
+                )
+                # Use a mid-range price so margin result is meaningful
+                sample_price = 1000.0
+                margin_data  = ref.api.check_margin(
+                    security_id = "2885",
+                    qty         = 1,
+                    price       = sample_price,
+                    segment     = seg,
+                    txn_type    = "BUY",
+                    product     = ref.api._api_product(trade_mode, seg),
+                    exchange    = "NSE"
+                )
+                if margin_data:
+                    margin_for_one = float(
+                        margin_data.get("total_margin", 0)
+                    )
+                    if margin_for_one > 0:
+                        leverage = round(
+                            sample_price / margin_for_one, 1
+                        )
+                        buying_power = true_balance * leverage
+                        charges      = margin_data.get(
+                            "charges", {}
+                        ).get("total_charges", 5.9)
+                        margin_line = (
+                            f"\n<b>📐 Margin &amp; Buying Power</b>\n"
+                            f"Leverage         : {leverage:.1f}x\n"
+                            f"Buying Power     : ₹{buying_power:,.2f}\n"
+                            f"(Balance × {leverage:.1f}x = "
+                            f"₹{true_balance:,.2f} × {leverage:.1f})\n"
+                            f"Brokerage/order  : ₹{charges:.2f}\n"
+                        )
+            except Exception as e:
+                logger.warning(f"Margin fetch for /funds failed: {e}")
+                margin_line = "\n<i>⚠️ Could not fetch margin info</i>\n"
+
             self._send(
                 "💵 <b>FUNDS BREAKDOWN</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<b>📈 Equity</b>\n"
+                f"<b>✅ Active Balance ({trade_mode})</b>\n"
+                f"{active_label} : ₹{true_balance:,.2f}{cap_line}\n"
+                f"{margin_line}\n"
+                "<b>📈 All Equity Limits</b>\n"
                 f"Intraday (MIS)   : ₹{avl.get('eq_mis', 0):,.2f}\n"
                 f"Delivery (CNC)   : ₹{avl.get('eq_cnc', 0):,.2f}\n"
                 f"Leveraged (MTF)  : ₹{avl.get('eq_mtf', 0):,.2f}\n\n"
-                "<b>📊 Derivatives</b>\n"
+                "<b>📊 Derivatives Limits</b>\n"
                 f"Futures (MARGIN) : ₹{avl.get('future', 0):,.2f}\n"
                 f"Options Buy      : ₹{avl.get('option_buy', 0):,.2f}\n"
                 f"Options Sell     : ₹{avl.get('option_sell', 0):,.2f}\n\n"
+                "ℹ️ <i>All above = same cash, split by segment.\n"
+                "Bot uses only the active mode balance.</i>\n\n"
                 "<b>💰 Account</b>\n"
                 f"Opening Balance  : ₹{f.get('sod_balance', 0):,.2f}\n"
                 f"Funds Added      : ₹{f.get('funds_added', 0):,.2f}\n"
@@ -732,11 +803,10 @@ class TelegramNotifier:
                 self._send("❌ Valid: MIS, CNC, MTF, MARGIN")
                 return
             ref.TRADE_MODE = mode
-            seg = "DERIVATIVE" if mode == "MARGIN" else "EQUITY"
-            bal = ref.get_balance(seg)
+            bal = ref.api.get_true_balance(mode)
             self._send(
                 f"✅ <b>Mode → {mode}</b>\n"
-                f"Available : ₹{bal:,.0f}"
+                f"Available : ₹{bal:,.2f}"
             )
 
         # ── /setcapital ───────────────────────────────────────

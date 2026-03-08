@@ -56,6 +56,66 @@ posmgr      = PositionManager(
 )
 trade_memory = TradeMemory()
 
+# ── India VIX ─────────────────────────────────────────────────
+# Fetched once every morning in daily_reset().
+# Used to gate trading and scale position sizes.
+_vix_data = {
+    "vix":        15.0,
+    "multiplier": 1.0,
+    "safe":       True,
+    "half_size":  False,
+    "stop_trade": False,
+}
+
+
+def get_india_vix() -> dict:
+    """
+    Fetches India VIX from NSE public API.
+    Called once every morning at daily_reset (09:14).
+    Also called at boot so first cycle has real data.
+
+    Returns:
+        vix        — current VIX value
+        safe       — VIX < 20, trade normally
+        half_size  — VIX 20–24, halve position sizes
+        stop_trade — VIX >= 25, do not trade at all
+        multiplier — position size factor (0.0 / 0.5 / 1.0)
+    """
+    try:
+        r = _req.get(
+            "https://www.nseindia.com/api/allIndices",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept":     "application/json",
+            },
+            timeout=5,
+        )
+        vix = next(
+            (float(i["last"])
+             for i in r.json().get("data", [])
+             if i.get("index") == "INDIA VIX"),
+            15.0,   # safe default if index not found
+        )
+        return {
+            "vix":        vix,
+            "safe":       vix < 20,
+            "half_size":  20 <= vix < 25,
+            "stop_trade": vix >= 25,
+            "multiplier": (
+                0.0 if vix >= 25 else
+                0.5 if vix >= 20 else
+                1.0
+            ),
+        }
+    except Exception as e:
+        logger.warning(f"VIX fetch failed: {e} — assuming safe (VIX=15)")
+        return {
+            "vix": 15.0, "safe": True,
+            "half_size": False, "stop_trade": False,
+            "multiplier": 1.0,
+        }
+
+
 # ── ML Trainers ───────────────────────────────────────────────
 trainers      = {}
 _trainer_lock = threading.Lock()
@@ -257,6 +317,14 @@ def run_cycle():
         logger.warning("⚠️ Token invalid — skipping cycle.")
         return
 
+    # ── VIX gate — stop trading on panic days ─────────────────
+    if _vix_data["stop_trade"]:
+        logger.info(
+            f"🔴 VIX {_vix_data['vix']:.1f} ≥ 25 "
+            f"— trading paused for safety"
+        )
+        return
+
     active = scanner.get_active()
     if not active:
         logger.warning("No active instruments.")
@@ -317,6 +385,11 @@ def run_cycle():
                     f"RR={result.get('rr_ratio', 0):.1f}"
                 )
 
+            vix_str = (
+                f" | VIX={_vix_data['vix']:.1f}"
+                f"{'⚠️' if _vix_data['half_size'] else ''}"
+            )
+
             logger.info(
                 f"[{cfg['name']}] ₹{ltp} | "
                 f"{result['signal']} {result['confidence']:.1%} | "
@@ -326,7 +399,7 @@ def run_cycle():
                 f"RL={result.get('rl','')} | "
                 f"Pattern={result.get('pattern','NONE')} "
                 f"Regime={result.get('regime','')}"
-                f"{sl_tp_str}"
+                f"{sl_tp_str}{vix_str}"
             )
 
             if result["signal"] == "BUY":
@@ -413,6 +486,19 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         rr_ratio   = result.get("rr_ratio",  0.0),
     )
     qty = risk.apply_per_trade_limit(qty, ltp)
+
+    # ── VIX position size scaling ─────────────────────────────
+    # half_size (VIX 20-24): multiply qty by 0.5
+    # stop_trade (VIX >= 25): already gated in run_cycle(),
+    #   but multiplier=0.0 acts as a safety net here too
+    if _vix_data["multiplier"] < 1.0:
+        original_qty = qty
+        qty = max(1, int(qty * _vix_data["multiplier"]))
+        logger.info(
+            f"⚠️ VIX {_vix_data['vix']:.1f} — "
+            f"qty scaled {original_qty} → {qty} "
+            f"(×{_vix_data['multiplier']})"
+        )
 
     margin = api.check_margin(
         cfg["security_id"], qty, ltp,
@@ -606,6 +692,7 @@ def process_exit(cfg: dict, ltp: float,
             "rr_ratio":         meta.get("rr_ratio", 0),
             "ev_quality":       meta.get("ev_quality", ""),
             "interval":         interval_key,
+            "vix":              _vix_data["vix"],
         })
 
         notifier.trade_closed(
@@ -641,7 +728,46 @@ def square_off_all():
 
 
 def daily_reset():
+    """
+    Runs every morning before market open.
+    Resets daily PnL counters, fetches fresh VIX,
+    and pauses/warns if VIX is elevated.
+    """
+    global _vix_data
     risk.reset_daily()
+
+    # Fetch today's VIX and act on it
+    _vix_data = get_india_vix()
+    logger.info(
+        f"🌡️ India VIX: {_vix_data['vix']:.1f} | "
+        f"{'✅ Safe' if _vix_data['safe'] else '⚠️ Caution' if _vix_data['half_size'] else '🔴 STOP'}"
+    )
+
+    if _vix_data["stop_trade"]:
+        notifier.send(
+            f"🔴 <b>VIX ALERT — Trading Paused Today</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"India VIX : {_vix_data['vix']:.1f}\n"
+            f"Threshold : 25.0\n"
+            f"Reason    : Extreme market fear\n"
+            f"Action    : Bot will NOT trade today\n\n"
+            f"Send /resume to override if you want to trade."
+        )
+        notifier.bot_paused = True
+
+    elif _vix_data["half_size"]:
+        notifier.send(
+            f"⚠️ <b>VIX WARNING — Reduced Sizes</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"India VIX  : {_vix_data['vix']:.1f}\n"
+            f"Threshold  : 20.0\n"
+            f"Action     : All position sizes halved today\n"
+            f"Trading    : Continues with caution"
+        )
+
+    else:
+        logger.info(f"VIX normal ({_vix_data['vix']:.1f}) — full size trading")
+
     logger.info("🔄 Daily counters reset")
 
 
@@ -685,6 +811,22 @@ if __name__ == "__main__":
     price_feed.start()
     order_feed.start()
     time.sleep(2)
+
+    # Fetch VIX at boot so first cycle has real data
+    _vix_data = get_india_vix()
+    logger.info(
+        f"🌡️ Boot VIX check: {_vix_data['vix']:.1f} | "
+        f"{'✅ Safe' if _vix_data['safe'] else '⚠️ Caution' if _vix_data['half_size'] else '🔴 STOP TRADING'}"
+    )
+    if _vix_data["stop_trade"]:
+        logger.warning(
+            "🔴 VIX >= 25 at boot — bot will not trade today"
+        )
+        notifier.send(
+            f"🔴 <b>Bot started but VIX = {_vix_data['vix']:.1f}</b>\n"
+            f"Trading paused. Send /resume to override."
+        )
+        notifier.bot_paused = True
 
     scanner.start_background_refresh()
     notifier.start_command_listener(bot_ref=sys.modules[__name__])

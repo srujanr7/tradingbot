@@ -51,14 +51,16 @@ class TelegramNotifier:
             f"Time   : {self._now()}\n"
             "Status : All systems running\n\n"
             "<b>📊 Info</b>\n"
-            "/status      → system health\n"
+            "/status      → system health + filters\n"
             "/risk        → risk dashboard\n"
             "/funds       → balance breakdown\n"
             "/pnl         → today's PnL\n"
             "/positions   → open positions\n"
             "/models      → model status\n"
             "/performance → all-time stats\n"
-            "/intervals   → active intervals\n\n"
+            "/intervals   → active intervals\n"
+            "/vix         → India VIX status\n"
+            "/filters     → active trading filters\n\n"
             "<b>⚙️ Controls</b>\n"
             "/stop      → pause trading\n"
             "/resume    → resume trading\n"
@@ -70,6 +72,10 @@ class TelegramNotifier:
             "/setdaily 3000\n"
             "/setslots 3 2\n"
             "/settrades 10\n\n"
+            "<b>🔍 Market Filters</b>\n"
+            "/setsegment EQUITY|FNO|BOTH\n"
+            "/setexchange NSE|BSE|BOTH\n"
+            "/setinstrument EQUITY|FUTURES|OPTIONS|ALL\n\n"
             "Send /help for full list"
         )
 
@@ -236,10 +242,19 @@ class TelegramNotifier:
         )
 
     def daily_summary(self, total_pnl: float, trades: int,
-                      wins: int, balance: float):
+                      wins: int, balance: float,
+                      vix: float = 0.0):
         losses   = trades - wins
         win_rate = wins / trades * 100 if trades > 0 else 0
         emoji    = "✅" if total_pnl >= 0 else "❌"
+        vix_line = ""
+        if vix > 0:
+            vix_icon = (
+                "🔴" if vix >= 25 else
+                "⚠️" if vix >= 20 else
+                "✅"
+            )
+            vix_line = f"India VIX  : {vix:.1f} {vix_icon}\n"
         self._send(
             f"{emoji} <b>DAILY SUMMARY</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -248,6 +263,7 @@ class TelegramNotifier:
             f"Wins       : {wins}  |  Losses: {losses}\n"
             f"Win Rate   : {win_rate:.1f}%\n"
             f"Balance    : ₹{balance:,.2f}\n"
+            f"{vix_line}"
             f"Date       : {datetime.now().strftime('%d %b %Y')}"
         )
 
@@ -299,19 +315,22 @@ class TelegramNotifier:
         args  = parts[1:]
         ref   = self._bot_ref
 
+        # ── /help ─────────────────────────────────────────────
         if cmd == "/help":
             self._send(
                 "ℹ️ <b>AVAILABLE COMMANDS</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "<b>📊 Info</b>\n"
-                "/status       → system health\n"
+                "/status       → system health + filters\n"
                 "/risk         → risk dashboard\n"
                 "/funds        → balance breakdown\n"
                 "/pnl          → today's PnL\n"
                 "/positions    → open positions + SL/TP\n"
                 "/models       → model status + weights\n"
                 "/performance  → all-time stats\n"
-                "/intervals    → active intervals\n\n"
+                "/intervals    → active intervals\n"
+                "/vix          → India VIX live status\n"
+                "/filters      → current trading filters\n\n"
                 "<b>⚙️ Controls</b>\n"
                 "/stop             → pause trading\n"
                 "/resume           → resume trading\n"
@@ -328,9 +347,157 @@ class TelegramNotifier:
                 "/setdaily 3000    → max daily loss ₹\n"
                 "/setdaily 0       → revert to 3% auto\n"
                 "/setslots 3 2     → equity/FNO slots\n"
-                "/settrades 10     → max trades today"
+                "/settrades 10     → max trades today\n\n"
+                "<b>🔍 Market Filters</b>\n"
+                "/setsegment EQUITY    → stocks only\n"
+                "/setsegment FNO       → futures &amp; options only\n"
+                "/setsegment BOTH      → all segments (default)\n"
+                "/setexchange NSE      → NSE only\n"
+                "/setexchange BSE      → BSE only\n"
+                "/setexchange BOTH     → all exchanges (default)\n"
+                "/setinstrument EQUITY   → stocks only\n"
+                "/setinstrument FUTURES  → futures only\n"
+                "/setinstrument OPTIONS  → options only\n"
+                "/setinstrument ALL      → everything (default)"
             )
 
+        # ── /vix ──────────────────────────────────────────────
+        elif cmd == "/vix":
+            if not ref:
+                return
+            vix_info = ref.get_india_vix()
+            vix      = vix_info["vix"]
+
+            if vix_info["stop_trade"]:
+                status_line = "🔴 TRADING STOPPED (VIX ≥ 25)"
+                action_line = "No new positions today."
+            elif vix_info["half_size"]:
+                status_line = "⚠️ REDUCED SIZES (VIX 20–24)"
+                action_line = "Position sizes halved today."
+            else:
+                status_line = "✅ NORMAL (VIX < 20)"
+                action_line = "Full position sizes active."
+
+            filled = min(10, int(vix / 4))
+            bar    = "█" * filled + "░" * (10 - filled)
+
+            self._send(
+                "🌡️ <b>INDIA VIX STATUS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Current VIX : {vix:.2f}\n"
+                f"Gauge       : [{bar}]\n\n"
+                f"Status  : {status_line}\n"
+                f"Action  : {action_line}\n\n"
+                "<b>Thresholds</b>\n"
+                "  &lt; 20  → ✅ Trade normally\n"
+                "  20–24 → ⚠️ Half position size\n"
+                "  ≥ 25  → 🔴 No trading\n\n"
+                f"Multiplier : {vix_info['multiplier']:.1f}×\n"
+                f"Bot Paused : {'Yes ⏸' if self.bot_paused else 'No ✅'}\n"
+                f"Time       : {self._now()}"
+            )
+
+        # ── /filters ──────────────────────────────────────────
+        elif cmd == "/filters":
+            if not ref:
+                return
+            seg  = getattr(ref, "ACTIVE_SEGMENT",    "BOTH")
+            exch = getattr(ref, "ACTIVE_EXCHANGE",   "BOTH")
+            inst = getattr(ref, "ACTIVE_INSTRUMENT", "ALL")
+
+            seg_desc = (
+                "Stocks only (NSE/BSE)"   if seg == "EQUITY" else
+                "Futures &amp; Options only" if seg == "FNO"    else
+                "All segments"
+            )
+            exch_desc = (
+                "NSE only" if exch == "NSE" else
+                "BSE only" if exch == "BSE" else
+                "NSE + BSE"
+            )
+            inst_desc = (
+                "Equity stocks only"  if inst == "EQUITY"  else
+                "Futures only"        if inst == "FUTURES"  else
+                "Options only"        if inst == "OPTIONS"  else
+                "All instruments"
+            )
+
+            self._send(
+                "🔍 <b>ACTIVE TRADING FILTERS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Segment    : {seg} — {seg_desc}\n"
+                f"Exchange   : {exch} — {exch_desc}\n"
+                f"Instrument : {inst} — {inst_desc}\n\n"
+                "<b>To change:</b>\n"
+                "/setsegment EQUITY|FNO|BOTH\n"
+                "/setexchange NSE|BSE|BOTH\n"
+                "/setinstrument EQUITY|FUTURES|OPTIONS|ALL\n\n"
+                f"Time : {self._now()}"
+            )
+
+        # ── /status ───────────────────────────────────────────
+        elif cmd == "/status":
+            if not ref:
+                return
+            st   = ref.posmgr.status()
+            vix  = ref._vix_data
+            seg  = getattr(ref, "ACTIVE_SEGMENT",    "BOTH")
+            exch = getattr(ref, "ACTIVE_EXCHANGE",   "BOTH")
+            inst = getattr(ref, "ACTIVE_INSTRUMENT", "ALL")
+
+            vix_line = (
+                f"VIX        : {vix['vix']:.1f} "
+                + ("✅ Safe" if vix["safe"] else
+                   "⚠️ Half-size" if vix["half_size"] else
+                   "🔴 STOPPED")
+                + "\n"
+            )
+            self._send(
+                "📊 <b>BOT STATUS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Mode       : {'⏸ Paused' if self.bot_paused else '✅ Live'}\n"
+                f"Trade Mode : {ref.TRADE_MODE}\n"
+                f"Positions  : {st['open_positions']} open\n"
+                f"Equity     : {st['equity_open']}/{ref.MAX_EQUITY_POS}\n"
+                f"FNO        : {st['fno_open']}/{ref.MAX_FNO_POS}\n"
+                f"Win Rate   : {st['win_rate']:.1f}%\n"
+                f"Daily PnL  : ₹{ref.risk.daily_pnl:+,.0f}\n"
+                f"Trades     : {ref.risk.trades_today}/{ref.risk.max_trades_per_day}\n"
+                f"{vix_line}"
+                f"Segment    : {seg}\n"
+                f"Exchange   : {exch}\n"
+                f"Instrument : {inst}\n"
+                f"Time       : {self._now()}"
+            )
+
+        # ── /risk ─────────────────────────────────────────────
+        elif cmd == "/risk":
+            if not ref:
+                return
+            seg   = "DERIVATIVE" if ref.TRADE_MODE == "MARGIN" else "EQUITY"
+            bal   = ref.get_balance(seg)
+            limit = ref.risk.get_daily_limit(bal)
+            used  = abs(min(ref.risk.daily_pnl, 0))
+            pct   = used / limit * 100 if limit else 0
+            st    = ref.posmgr.status()
+            self._send(
+                "💰 <b>RISK DASHBOARD</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Trade Mode       : {ref.TRADE_MODE}\n"
+                f"Active Balance   : ₹{bal:,.0f}\n"
+                f"Capital Limit    : {'₹' + f'{ref.TRADE_CAPITAL:,.0f}' if ref.TRADE_CAPITAL else 'No limit'}\n"
+                f"Daily Loss Limit : ₹{limit:,.0f} {'(custom)' if ref.risk.daily_loss_cap else '(3% auto)'}\n"
+                f"Daily Loss Used  : ₹{used:,.0f} ({pct:.0f}%)\n"
+                f"Per Trade Limit  : {'₹' + f'{ref.risk.per_trade_limit:,.0f}' if ref.risk.per_trade_limit else 'No limit'}\n"
+                f"Max Trades/Day   : {ref.risk.max_trades_per_day}\n"
+                f"Trades Today     : {ref.risk.trades_today}\n\n"
+                f"Equity : {st['equity_open']}/{ref.MAX_EQUITY_POS} slots\n"
+                f"FNO    : {st['fno_open']}/{ref.MAX_FNO_POS} slots\n\n"
+                f"Status : {'⏸ Paused' if self.bot_paused else '✅ Active'}\n"
+                f"Time   : {self._now()}"
+            )
+
+        # ── /funds ────────────────────────────────────────────
         elif cmd == "/funds":
             if not ref:
                 return
@@ -361,50 +528,7 @@ class TelegramNotifier:
                 f"Time : {self._now()}"
             )
 
-        elif cmd == "/status":
-            if not ref:
-                return
-            st = ref.posmgr.status()
-            self._send(
-                "📊 <b>BOT STATUS</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"Mode       : {'⏸ Paused' if self.bot_paused else '✅ Live'}\n"
-                f"Trade Mode : {ref.TRADE_MODE}\n"
-                f"Positions  : {st['open_positions']} open\n"
-                f"Equity     : {st['equity_open']}/{ref.MAX_EQUITY_POS}\n"
-                f"FNO        : {st['fno_open']}/{ref.MAX_FNO_POS}\n"
-                f"Win Rate   : {st['win_rate']:.1f}%\n"
-                f"Daily PnL  : ₹{ref.risk.daily_pnl:+,.0f}\n"
-                f"Trades     : {ref.risk.trades_today}/{ref.risk.max_trades_per_day}\n"
-                f"Time       : {self._now()}"
-            )
-
-        elif cmd == "/risk":
-            if not ref:
-                return
-            seg   = "DERIVATIVE" if ref.TRADE_MODE == "MARGIN" else "EQUITY"
-            bal   = ref.get_balance(seg)
-            limit = ref.risk.get_daily_limit(bal)
-            used  = abs(min(ref.risk.daily_pnl, 0))
-            pct   = used / limit * 100 if limit else 0
-            st    = ref.posmgr.status()
-            self._send(
-                "💰 <b>RISK DASHBOARD</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"Trade Mode       : {ref.TRADE_MODE}\n"
-                f"Active Balance   : ₹{bal:,.0f}\n"
-                f"Capital Limit    : {'₹' + f'{ref.TRADE_CAPITAL:,.0f}' if ref.TRADE_CAPITAL else 'No limit'}\n"
-                f"Daily Loss Limit : ₹{limit:,.0f} {'(custom)' if ref.risk.daily_loss_cap else '(3% auto)'}\n"
-                f"Daily Loss Used  : ₹{used:,.0f} ({pct:.0f}%)\n"
-                f"Per Trade Limit  : {'₹' + f'{ref.risk.per_trade_limit:,.0f}' if ref.risk.per_trade_limit else 'No limit'}\n"
-                f"Max Trades/Day   : {ref.risk.max_trades_per_day}\n"
-                f"Trades Today     : {ref.risk.trades_today}\n\n"
-                f"Equity : {st['equity_open']}/{ref.MAX_EQUITY_POS} slots\n"
-                f"FNO    : {st['fno_open']}/{ref.MAX_FNO_POS} slots\n\n"
-                f"Status : {'⏸ Paused' if self.bot_paused else '✅ Active'}\n"
-                f"Time   : {self._now()}"
-            )
-
+        # ── /pnl ──────────────────────────────────────────────
         elif cmd == "/pnl":
             if not ref:
                 return
@@ -421,6 +545,7 @@ class TelegramNotifier:
                 f"Time           : {self._now()}"
             )
 
+        # ── /positions ────────────────────────────────────────
         elif cmd == "/positions":
             if not ref:
                 return
@@ -455,6 +580,7 @@ class TelegramNotifier:
             lines.append(f"Time : {self._now()}")
             self._send("\n\n".join(lines))
 
+        # ── /models ───────────────────────────────────────────
         elif cmd == "/models":
             if not ref:
                 return
@@ -471,7 +597,6 @@ class TelegramNotifier:
             from ml.meta_model import MetaModel
             weights = MetaModel().weights
 
-            # Confidence gates per instrument
             gate_lines = ""
             for sc, t in ref.trainers.items():
                 gate_lines += (
@@ -496,6 +621,7 @@ class TelegramNotifier:
                 f"Time    : {self._now()}"
             )
 
+        # ── /intervals ────────────────────────────────────────
         elif cmd == "/intervals":
             if not ref:
                 return
@@ -507,6 +633,7 @@ class TelegramNotifier:
             lines.append(f"\nTime : {self._now()}")
             self._send("\n".join(lines))
 
+        # ── /performance ──────────────────────────────────────
         elif cmd == "/performance":
             if not ref:
                 return
@@ -514,7 +641,6 @@ class TelegramNotifier:
             stats = TradeMemory().get_stats()
             pf    = stats.get("profit_factor", 0)
 
-            # Exit reason breakdown
             from ml.trade_memory import TradeMemory as TM
             df = TM().df
             reason_lines = ""
@@ -544,6 +670,7 @@ class TelegramNotifier:
                 + f"Time           : {self._now()}"
             )
 
+        # ── /stop ─────────────────────────────────────────────
         elif cmd == "/stop":
             self.bot_paused = True
             self._send(
@@ -554,6 +681,7 @@ class TelegramNotifier:
                 "Send /resume to restart."
             )
 
+        # ── /resume ───────────────────────────────────────────
         elif cmd == "/resume":
             self.bot_paused = False
             self._send(
@@ -562,6 +690,7 @@ class TelegramNotifier:
                 f"Time : {self._now()}"
             )
 
+        # ── /pause ────────────────────────────────────────────
         elif cmd == "/pause":
             minutes   = (
                 int(args[0]) if args and args[0].isdigit()
@@ -587,6 +716,7 @@ class TelegramNotifier:
                 target=_auto_resume, daemon=True
             ).start()
 
+        # ── /setmode ──────────────────────────────────────────
         elif cmd == "/setmode":
             if not args:
                 self._send(
@@ -609,6 +739,7 @@ class TelegramNotifier:
                 f"Available : ₹{bal:,.0f}"
             )
 
+        # ── /setcapital ───────────────────────────────────────
         elif cmd == "/setcapital":
             if not args:
                 self._send(
@@ -632,6 +763,7 @@ class TelegramNotifier:
                     "<code>/setcapital 2000</code>"
                 )
 
+        # ── /setlimit ─────────────────────────────────────────
         elif cmd == "/setlimit":
             if not args:
                 self._send(
@@ -655,6 +787,7 @@ class TelegramNotifier:
                     "<code>/setlimit 5000</code>"
                 )
 
+        # ── /setdaily ─────────────────────────────────────────
         elif cmd == "/setdaily":
             if not args:
                 self._send(
@@ -680,6 +813,7 @@ class TelegramNotifier:
                     "<code>/setdaily 3000</code>"
                 )
 
+        # ── /setslots ─────────────────────────────────────────
         elif cmd == "/setslots":
             if len(args) < 2:
                 self._send(
@@ -702,6 +836,7 @@ class TelegramNotifier:
                     "<code>/setslots 3 2</code>"
                 )
 
+        # ── /settrades ────────────────────────────────────────
         elif cmd == "/settrades":
             if not args:
                 self._send(
@@ -721,6 +856,89 @@ class TelegramNotifier:
                     "<code>/settrades 10</code>"
                 )
 
+        # ── /setsegment ───────────────────────────────────────
+        elif cmd == "/setsegment":
+            if not args:
+                self._send(
+                    "Usage: <code>/setsegment EQUITY</code>\n\n"
+                    "EQUITY → stocks only (NSE/BSE)\n"
+                    "FNO    → futures &amp; options only\n"
+                    "BOTH   → all segments (default)"
+                )
+                return
+            val = args[0].upper()
+            if val not in ("EQUITY", "FNO", "BOTH"):
+                self._send("❌ Valid values: EQUITY, FNO, BOTH")
+                return
+            ref.ACTIVE_SEGMENT = val
+            desc = (
+                "Stocks only (NSE/BSE)"      if val == "EQUITY" else
+                "Futures &amp; Options only" if val == "FNO"    else
+                "All segments"
+            )
+            self._send(
+                f"✅ <b>Segment filter → {val}</b>\n"
+                f"Trading   : {desc}\n"
+                f"Time      : {self._now()}"
+            )
+
+        # ── /setexchange ──────────────────────────────────────
+        elif cmd == "/setexchange":
+            if not args:
+                self._send(
+                    "Usage: <code>/setexchange NSE</code>\n\n"
+                    "NSE  → NSE listed only\n"
+                    "BSE  → BSE listed only\n"
+                    "BOTH → all exchanges (default)"
+                )
+                return
+            val = args[0].upper()
+            if val not in ("NSE", "BSE", "BOTH"):
+                self._send("❌ Valid values: NSE, BSE, BOTH")
+                return
+            ref.ACTIVE_EXCHANGE = val
+            desc = (
+                "NSE only"      if val == "NSE"  else
+                "BSE only"      if val == "BSE"  else
+                "NSE + BSE"
+            )
+            self._send(
+                f"✅ <b>Exchange filter → {val}</b>\n"
+                f"Trading   : {desc}\n"
+                f"Time      : {self._now()}"
+            )
+
+        # ── /setinstrument ────────────────────────────────────
+        elif cmd == "/setinstrument":
+            if not args:
+                self._send(
+                    "Usage: <code>/setinstrument FUTURES</code>\n\n"
+                    "EQUITY  → equity stocks only\n"
+                    "FUTURES → futures contracts only\n"
+                    "OPTIONS → options contracts only\n"
+                    "ALL     → all instruments (default)"
+                )
+                return
+            val = args[0].upper()
+            if val not in ("EQUITY", "FUTURES", "OPTIONS", "ALL"):
+                self._send(
+                    "❌ Valid values: EQUITY, FUTURES, OPTIONS, ALL"
+                )
+                return
+            ref.ACTIVE_INSTRUMENT = val
+            desc = (
+                "Equity stocks only"  if val == "EQUITY"  else
+                "Futures only"        if val == "FUTURES" else
+                "Options only"        if val == "OPTIONS" else
+                "All instruments"
+            )
+            self._send(
+                f"✅ <b>Instrument filter → {val}</b>\n"
+                f"Trading   : {desc}\n"
+                f"Time      : {self._now()}"
+            )
+
+        # ── unknown command ───────────────────────────────────
         elif cmd.startswith("/"):
             self._send(
                 f"❓ Unknown: <code>{cmd}</code>\n"
@@ -732,4 +950,3 @@ class TelegramNotifier:
 
     def _now(self) -> str:
         return datetime.now().strftime("%d %b %Y %H:%M:%S")
-

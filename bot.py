@@ -176,7 +176,7 @@ def _monitor_open_positions(active: list):
       3. Trailing stop
       4. Time exit (> 2 hours)
     Exits immediately if any condition is met.
-    This runs BEFORE scanning for new entries.
+    Runs BEFORE scanning for new entries.
     """
     for scrip_code, pos in list(posmgr.positions.items()):
         meta = pos.get("signal_meta", {})
@@ -216,9 +216,8 @@ def _monitor_open_positions(active: list):
             trail_exit = t_info["exit_now"]
             locked_pnl = t_info.get("locked_pnl", 0.0)
 
-        # Exit conditions
-        hard_sl     = ltp <= stop_loss
-        tp_hit      = ltp >= take_profit
+        hard_sl   = ltp <= stop_loss
+        tp_hit    = ltp >= take_profit
 
         opened_at    = datetime.fromisoformat(
             pos.get("opened_at", datetime.now().isoformat())
@@ -271,8 +270,6 @@ def run_cycle():
 
     def scan_instrument(cfg):
         try:
-            # If we already hold this instrument, only check
-            # for model SELL signal (SL/TP handled above)
             if posmgr.has_position(cfg["scrip_code"]):
                 token = cfg["ws_token"].split(":")[1]
                 ltp   = price_feed.get_ltp(token)
@@ -406,16 +403,15 @@ def process_entry(cfg: dict, result: dict, ltp: float):
     if risk.daily_pnl < -(limit * 0.8):
         notifier.risk_warning(risk.daily_pnl, limit, balance)
 
-    # Kelly-aware sizing — use Kelly % if available
-    kelly_pct = result.get("kelly_pct", 0.0)
-    if kelly_pct and kelly_pct > 0:
-        kelly_alloc = balance * (kelly_pct / 100)
-        qty = max(1, int(kelly_alloc / ltp))
-    else:
-        qty = posmgr.position_size(
-            balance, ltp, effective_segment,
-            result["confidence"]
-        )
+    # ── Fully automatic sizing — Kelly first, confidence fallback
+    qty = posmgr.position_size(
+        balance    = balance,
+        price      = ltp,
+        segment    = effective_segment,
+        confidence = result["confidence"],
+        kelly_pct  = result.get("kelly_pct", 0.0),
+        rr_ratio   = result.get("rr_ratio",  0.0),
+    )
     qty = risk.apply_per_trade_limit(qty, ltp)
 
     margin = api.check_margin(
@@ -457,8 +453,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
             )
             return
 
-        # SL/TP levels — prefer ATR-based from signal,
-        # fall back to fixed 1%/2%
+        # ATR-based SL/TP — prefer signal levels, fall back fixed
         stop_loss   = result.get("stop_loss")  or round(avg_price * 0.99, 2)
         take_profit = result.get("take_profit") or round(avg_price * 1.02, 2)
         atr_val     = result.get("atr") or avg_price * 0.01

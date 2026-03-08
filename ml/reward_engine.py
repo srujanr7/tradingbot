@@ -1,4 +1,3 @@
-import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
@@ -6,72 +5,55 @@ logger = logging.getLogger(__name__)
 
 class RewardEngine:
     """
-    Calculates rewards for RL training.
-    Rewards wins heavily, penalizes losses harder,
-    encourages risk-adjusted returns.
+    Converts trade outcomes into RL reward signals.
+
+    Rules:
+      Base reward    = PnL %
+      Quick win      × 1.5  (efficient capital use)
+      Long loser     × 2.0  (punish holding losses)
+      High drawdown  − 5.0  (punish risky wins)
+      Volatile win   × 1.3  (bonus for hard conditions)
+      Clean win      × 1.2  (low drawdown + profitable)
     """
 
-    def __init__(self):
-        self.win_streak  = 0
-        self.loss_streak = 0
+    def calculate(self,
+                  entry:            float,
+                  exit_price:       float,
+                  held_candles:     int,
+                  signal:           dict,
+                  max_drawdown_pct: float = 0.0) -> float:
 
-    def calculate(self, pnl: float, pnl_pct: float,
-                  hold_minutes: int, confidence: float,
-                  sentiment: float) -> float:
-        """
-        Multi-factor reward calculation.
-        Returns reward score used to train RL models.
-        """
-        reward = 0.0
+        if entry <= 0:
+            return 0.0
 
-        # ── Base reward from PnL ──────────────────────────
-        if pnl_pct > 0:
-            # Win — reward scales with size of win
-            reward += pnl_pct * 100
-            self.win_streak  += 1
-            self.loss_streak  = 0
+        pnl_pct = (exit_price - entry) / entry * 100
+        reward  = pnl_pct
 
-            # Bonus for win streak
-            if self.win_streak >= 3:
-                reward *= 1.2
-                logger.debug(f"Win streak bonus: {self.win_streak}")
+        # Quick wins are efficient — reward them
+        if pnl_pct > 0 and held_candles <= 3:
+            reward *= 1.5
 
-        else:
-            # Loss — penalize 2x to make agent risk-averse
-            reward += pnl_pct * 200
-            self.loss_streak += 1
-            self.win_streak   = 0
+        # Held a loser too long — double the pain
+        if pnl_pct < 0 and held_candles > 10:
+            reward *= 2.0
 
-            # Extra penalty for loss streak
-            if self.loss_streak >= 3:
-                reward *= 1.5
-                logger.debug(f"Loss streak penalty: {self.loss_streak}")
+        # High drawdown even on a winner — penalise
+        if max_drawdown_pct > 2.0:
+            reward -= 5.0
 
-        # ── Hold time penalty ─────────────────────────────
-        # Penalize holding too long (> 4 hours for intraday)
-        if hold_minutes > 240:
-            reward -= 0.5
+        # Won in volatile conditions — bonus
+        if (signal.get("regime") == "VOLATILE"
+                and pnl_pct > 0):
+            reward *= 1.3
 
-        # ── Confidence alignment bonus ────────────────────
-        # Reward when high confidence trade wins
-        if confidence > 0.8 and pnl_pct > 0:
-            reward += 1.0
-        # Penalize when high confidence trade loses
-        elif confidence > 0.8 and pnl_pct < 0:
-            reward -= 1.5
+        # Clean win: profitable AND low drawdown
+        if pnl_pct > 0 and max_drawdown_pct < 0.5:
+            reward *= 1.2
 
-        # ── Sentiment alignment bonus ─────────────────────
-        if sentiment > 0.3 and pnl_pct > 0:
-            reward += 0.3   # sentiment agreed, reward
-        elif sentiment < -0.3 and pnl_pct > 0:
-            reward += 0.5   # traded against sentiment and won — big reward
-        elif sentiment < -0.3 and pnl_pct < 0:
-            reward -= 0.3   # ignored negative sentiment warning
-
+        logger.debug(
+            f"RewardEngine: pnl={pnl_pct:+.2f}% "
+            f"candles={held_candles} "
+            f"drawdown={max_drawdown_pct:.2f}% "
+            f"→ reward={reward:.3f}"
+        )
         return round(reward, 4)
-
-    def get_streaks(self) -> dict:
-        return {
-            "win_streak":  self.win_streak,
-            "loss_streak": self.loss_streak
-        }

@@ -9,10 +9,6 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramNotifier:
-    """
-    Sends alerts to Telegram and listens for commands.
-    All sends are fire-and-forget background threads.
-    """
 
     BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -22,10 +18,6 @@ class TelegramNotifier:
         self._last_update = 0
         self._running     = False
         self._bot_ref     = None
-
-    # ─────────────────────────────────────────────────────────
-    # CORE SEND
-    # ─────────────────────────────────────────────────────────
 
     def send(self, message: str):
         self._send(message)
@@ -59,13 +51,14 @@ class TelegramNotifier:
             f"Time   : {self._now()}\n"
             "Status : All systems running\n\n"
             "<b>📊 Info</b>\n"
-            "/status    → system health\n"
-            "/risk      → risk dashboard\n"
-            "/funds     → balance breakdown\n"
-            "/pnl       → today's PnL\n"
-            "/positions → open positions\n"
-            "/models    → model status\n"
-            "/performance → all-time stats\n\n"
+            "/status      → system health\n"
+            "/risk        → risk dashboard\n"
+            "/funds       → balance breakdown\n"
+            "/pnl         → today's PnL\n"
+            "/positions   → open positions\n"
+            "/models      → model status\n"
+            "/performance → all-time stats\n"
+            "/intervals   → active intervals\n\n"
             "<b>⚙️ Controls</b>\n"
             "/stop      → pause trading\n"
             "/resume    → resume trading\n"
@@ -92,7 +85,12 @@ class TelegramNotifier:
                        segment: str, qty: int, price: float,
                        confidence: float, xgb: str, rl: str,
                        lgbm: str = "", lstm: str = "",
-                       pattern: str = "", regime: str = ""):
+                       pattern: str = "", regime: str = "",
+                       stop_loss: float = 0,
+                       take_profit: float = 0,
+                       rr_ratio: float = 0,
+                       sl_pct: float = 0,
+                       tp_pct: float = 0):
         emoji = "🟢" if side == "BUY" else "🔴"
         extra = ""
         if lgbm:
@@ -103,6 +101,15 @@ class TelegramNotifier:
             extra += f"Pattern    : {pattern}\n"
         if regime:
             extra += f"Regime     : {regime}\n"
+        sl_tp = ""
+        if stop_loss and take_profit:
+            sl_tp = (
+                f"Stop Loss  : ₹{stop_loss:,.2f} "
+                f"(-{sl_pct:.2f}%)\n"
+                f"Take Profit: ₹{take_profit:,.2f} "
+                f"(+{tp_pct:.2f}%)\n"
+                f"RR Ratio   : {rr_ratio:.1f}:1\n"
+            )
         self._send(
             f"{emoji} <b>{side} EXECUTED</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -113,15 +120,20 @@ class TelegramNotifier:
             f"XGB        : {xgb}\n"
             f"RL         : {rl}\n"
             f"{extra}"
+            f"{sl_tp}"
             f"Confidence : {confidence*100:.1f}%\n"
             f"Time       : {self._now()}"
         )
 
     def trade_closed(self, name: str, qty: int,
                      entry: float, exit_price: float,
-                     pnl: float, daily_pnl: float):
-        emoji = "✅" if pnl >= 0 else "❌"
-        pct   = (exit_price - entry) / entry * 100
+                     pnl: float, daily_pnl: float,
+                     reason: str = ""):
+        emoji  = "✅" if pnl >= 0 else "❌"
+        pct    = (exit_price - entry) / entry * 100
+        reason_line = (
+            f"Exit Reason: {reason}\n" if reason else ""
+        )
         self._send(
             f"{emoji} <b>POSITION CLOSED</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -129,6 +141,7 @@ class TelegramNotifier:
             f"Qty        : {qty}\n"
             f"Entry      : ₹{entry:,.2f}\n"
             f"Exit       : ₹{exit_price:,.2f}\n"
+            f"{reason_line}"
             f"PnL        : ₹{pnl:+,.2f} ({pct:+.2f}%)\n"
             f"Daily PnL  : ₹{daily_pnl:+,.2f}\n"
             f"Time       : {self._now()}"
@@ -147,7 +160,8 @@ class TelegramNotifier:
         )
 
     def insufficient_margin(self, name: str,
-                             required: float, available: float):
+                             required: float,
+                             available: float):
         self._send(
             "⚠️ <b>INSUFFICIENT MARGIN</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -294,8 +308,8 @@ class TelegramNotifier:
                 "/risk         → risk dashboard\n"
                 "/funds        → balance breakdown\n"
                 "/pnl          → today's PnL\n"
-                "/positions    → open positions\n"
-                "/models       → model status\n"
+                "/positions    → open positions + SL/TP\n"
+                "/models       → model status + weights\n"
                 "/performance  → all-time stats\n"
                 "/intervals    → active intervals\n\n"
                 "<b>⚙️ Controls</b>\n"
@@ -322,7 +336,7 @@ class TelegramNotifier:
                 return
             f = ref.get_all_balances()
             if not f:
-                self._send("❌ Could not fetch funds. Check token.")
+                self._send("❌ Could not fetch funds.")
                 return
             avl = f.get("detailed_avl_balance", {})
             self._send(
@@ -414,18 +428,28 @@ class TelegramNotifier:
             if not positions:
                 self._send("📭 No open positions")
                 return
-            lines = ["📋 <b>OPEN POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━━"]
+            lines = [
+                "📋 <b>OPEN POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━━"
+            ]
             for sc, pos in positions.items():
                 meta    = pos.get("signal_meta", {})
+                sl      = meta.get("stop_loss")
+                tp      = meta.get("take_profit")
                 pattern = meta.get("pattern", "")
                 regime  = meta.get("regime", "")
+                sl_line = (
+                    f"  SL / TP : ₹{sl:,.2f} / ₹{tp:,.2f}\n"
+                    if sl and tp else ""
+                )
                 lines.append(
                     f"<b>{pos['name']}</b>\n"
                     f"  Qty     : {pos['qty']}\n"
                     f"  Entry   : ₹{pos['entry']:,.2f}\n"
                     f"  Segment : {pos['segment']}\n"
                     f"  Conf    : {meta.get('confidence', 0):.1%}\n"
-                    + (f"  Pattern : {pattern}\n" if pattern and pattern != "NONE" else "")
+                    f"{sl_line}"
+                    + (f"  Pattern : {pattern}\n"
+                       if pattern and pattern != "NONE" else "")
                     + (f"  Regime  : {regime}\n" if regime else "")
                 )
             lines.append(f"Time : {self._now()}")
@@ -444,9 +468,16 @@ class TelegramNotifier:
             lgbm  = len([f for f in files if f.startswith("lgbm")])
             lstm  = len([f for f in files if f.startswith("lstm")])
             ppo   = len([f for f in files if f.startswith("ppo")])
-            # MetaModel weights
             from ml.meta_model import MetaModel
             weights = MetaModel().weights
+
+            # Confidence gates per instrument
+            gate_lines = ""
+            for sc, t in ref.trainers.items():
+                gate_lines += (
+                    f"  {sc} → gate={t._confidence_gate:.0%}\n"
+                )
+
             self._send(
                 "🤖 <b>MODEL STATUS</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -459,15 +490,18 @@ class TelegramNotifier:
                 f"PPO  : {weights.get('ppo', 0):.3f}\n"
                 f"A2C  : {weights.get('a2c', 0):.3f}\n"
                 f"Sent : {weights.get('sentiment', 0):.3f}\n\n"
-                f"Retrain  : Every Sunday 18:30\n"
-                f"Interval : Every Sunday 17:00\n"
-                f"Time     : {self._now()}"
+                "<b>Adaptive Confidence Gates</b>\n"
+                f"{gate_lines if gate_lines else '  No trainers yet\n'}"
+                f"Retrain : Every Sunday 18:30\n"
+                f"Time    : {self._now()}"
             )
 
         elif cmd == "/intervals":
             if not ref:
                 return
-            lines = ["⏱ <b>ACTIVE INTERVALS</b>\n━━━━━━━━━━━━━━━━━━━━"]
+            lines = [
+                "⏱ <b>ACTIVE INTERVALS</b>\n━━━━━━━━━━━━━━━━━━━━"
+            ]
             for sc, trainer in ref.trainers.items():
                 lines.append(f"  {sc} → {trainer.interval}")
             lines.append(f"\nTime : {self._now()}")
@@ -479,6 +513,16 @@ class TelegramNotifier:
             from ml.trade_memory import TradeMemory
             stats = TradeMemory().get_stats()
             pf    = stats.get("profit_factor", 0)
+
+            # Exit reason breakdown
+            from ml.trade_memory import TradeMemory as TM
+            df = TM().df
+            reason_lines = ""
+            if not df.empty and "exit_reason" in df.columns:
+                counts = df["exit_reason"].value_counts()
+                for reason, cnt in counts.items():
+                    reason_lines += f"  {reason}: {cnt}\n"
+
             self._send(
                 "📈 <b>ALL-TIME PERFORMANCE</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -491,8 +535,13 @@ class TelegramNotifier:
                 f"Profit Factor  : {pf:.2f}x\n"
                 f"Best Trade     : ₹{stats['best_trade']:+,.2f}\n"
                 f"Worst Trade    : ₹{stats['worst_trade']:+,.2f}\n"
-                f"Total PnL      : ₹{stats['total_pnl']:+,.2f}\n"
-                f"Time           : {self._now()}"
+                f"Total PnL      : ₹{stats['total_pnl']:+,.2f}\n\n"
+                + (
+                    "<b>Exit Reasons</b>\n"
+                    + reason_lines
+                    if reason_lines else ""
+                )
+                + f"Time           : {self._now()}"
             )
 
         elif cmd == "/stop":
@@ -514,7 +563,10 @@ class TelegramNotifier:
             )
 
         elif cmd == "/pause":
-            minutes   = int(args[0]) if args and args[0].isdigit() else 30
+            minutes   = (
+                int(args[0]) if args and args[0].isdigit()
+                else 30
+            )
             self.bot_paused = True
             resume_at = datetime.now() + timedelta(minutes=minutes)
             self._send(
@@ -531,7 +583,9 @@ class TelegramNotifier:
                     "▶️ <b>AUTO-RESUMED</b>\n"
                     f"Time : {self._now()}"
                 )
-            threading.Thread(target=_auto_resume, daemon=True).start()
+            threading.Thread(
+                target=_auto_resume, daemon=True
+            ).start()
 
         elif cmd == "/setmode":
             if not args:
@@ -557,22 +611,33 @@ class TelegramNotifier:
 
         elif cmd == "/setcapital":
             if not args:
-                self._send("Usage: <code>/setcapital 2000</code> or 0 to remove")
+                self._send(
+                    "Usage: <code>/setcapital 2000</code> "
+                    "or 0 to remove"
+                )
                 return
             try:
                 amount = float(args[0])
                 if amount <= 0:
                     ref.TRADE_CAPITAL = None
-                    self._send("✅ Capital limit removed — using all funds.")
+                    self._send("✅ Capital limit removed.")
                 else:
                     ref.TRADE_CAPITAL = amount
-                    self._send(f"✅ Capital limit: ₹{amount:,.0f}")
+                    self._send(
+                        f"✅ Capital limit: ₹{amount:,.0f}"
+                    )
             except ValueError:
-                self._send("❌ Invalid. Usage: <code>/setcapital 2000</code>")
+                self._send(
+                    "❌ Invalid. Usage: "
+                    "<code>/setcapital 2000</code>"
+                )
 
         elif cmd == "/setlimit":
             if not args:
-                self._send("Usage: <code>/setlimit 5000</code> or 0 to remove")
+                self._send(
+                    "Usage: <code>/setlimit 5000</code> "
+                    "or 0 to remove"
+                )
                 return
             try:
                 amount = float(args[0])
@@ -581,28 +646,45 @@ class TelegramNotifier:
                     self._send("✅ Per-trade limit removed.")
                 else:
                     ref.risk.per_trade_limit = amount
-                    self._send(f"✅ Per-trade limit: ₹{amount:,.0f}")
+                    self._send(
+                        f"✅ Per-trade limit: ₹{amount:,.0f}"
+                    )
             except ValueError:
-                self._send("❌ Invalid. Usage: <code>/setlimit 5000</code>")
+                self._send(
+                    "❌ Invalid. Usage: "
+                    "<code>/setlimit 5000</code>"
+                )
 
         elif cmd == "/setdaily":
             if not args:
-                self._send("Usage: <code>/setdaily 3000</code> or 0 for 3% auto")
+                self._send(
+                    "Usage: <code>/setdaily 3000</code> "
+                    "or 0 for 3% auto"
+                )
                 return
             try:
                 amount = float(args[0])
                 if amount <= 0:
                     ref.risk.daily_loss_cap = None
-                    self._send("✅ Daily cap removed — reverting to 3%.")
+                    self._send(
+                        "✅ Daily cap removed — reverting to 3%."
+                    )
                 else:
                     ref.risk.daily_loss_cap = amount
-                    self._send(f"✅ Daily loss cap: ₹{amount:,.0f}")
+                    self._send(
+                        f"✅ Daily loss cap: ₹{amount:,.0f}"
+                    )
             except ValueError:
-                self._send("❌ Invalid. Usage: <code>/setdaily 3000</code>")
+                self._send(
+                    "❌ Invalid. Usage: "
+                    "<code>/setdaily 3000</code>"
+                )
 
         elif cmd == "/setslots":
             if len(args) < 2:
-                self._send("Usage: <code>/setslots 3 2</code>")
+                self._send(
+                    "Usage: <code>/setslots 3 2</code>"
+                )
                 return
             try:
                 eq  = int(args[0])
@@ -612,15 +694,19 @@ class TelegramNotifier:
                 ref.MAX_EQUITY_POS    = eq
                 ref.MAX_FNO_POS       = fno
                 self._send(
-                    f"✅ Slots updated\n"
-                    f"Equity : {eq} | FNO : {fno}"
+                    f"✅ Slots: Equity={eq} | FNO={fno}"
                 )
             except ValueError:
-                self._send("❌ Invalid. Usage: <code>/setslots 3 2</code>")
+                self._send(
+                    "❌ Invalid. Usage: "
+                    "<code>/setslots 3 2</code>"
+                )
 
         elif cmd == "/settrades":
             if not args:
-                self._send("Usage: <code>/settrades 10</code>")
+                self._send(
+                    "Usage: <code>/settrades 10</code>"
+                )
                 return
             try:
                 n = int(args[0])
@@ -630,7 +716,10 @@ class TelegramNotifier:
                     f"Used today: {ref.risk.trades_today}"
                 )
             except ValueError:
-                self._send("❌ Invalid. Usage: <code>/settrades 10</code>")
+                self._send(
+                    "❌ Invalid. Usage: "
+                    "<code>/settrades 10</code>"
+                )
 
         elif cmd.startswith("/"):
             self._send(

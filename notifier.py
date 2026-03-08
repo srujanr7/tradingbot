@@ -491,7 +491,7 @@ class TelegramNotifier:
                 f"A2C  : {weights.get('a2c', 0):.3f}\n"
                 f"Sent : {weights.get('sentiment', 0):.3f}\n\n"
                 "<b>Adaptive Confidence Gates</b>\n"
-                f"{gate_lines if gate_lines else '  No trainers yet\n'}"
+                f"{gate_lines or '  No trainers yet' + chr(10)}"
                 f"Retrain : Every Sunday 18:30\n"
                 f"Time    : {self._now()}"
             )
@@ -732,3 +732,4 @@ class TelegramNotifier:
 
     def _now(self) -> str:
         return datetime.now().strftime("%d %b %Y %H:%M:%S")
+

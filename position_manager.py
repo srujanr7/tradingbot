@@ -8,7 +8,13 @@ class PositionManager:
     """
     Manages open position slots, sizing, and signal ranking.
     Equity and FNO slots are tracked independently.
+    Sizing priority:
+      1. Kelly % if available (edge-based, from PatternMemory WR)
+      2. Confidence-scaled slot allocation (fallback, month 1)
+    Both capped at MAX_PER_TRADE = 10% of balance.
     """
+
+    MAX_PER_TRADE = 0.10   # hard cap per trade regardless of Kelly
 
     def __init__(self, max_equity: int = 3,
                  max_fno: int = 2,
@@ -16,7 +22,7 @@ class PositionManager:
         self.max_equity     = max_equity
         self.max_fno        = max_fno
         self.min_confidence = min_confidence
-        self.positions      = {}   # {scrip_code: position_dict}
+        self.positions      = {}
         self.win_count      = 0
         self.loss_count     = 0
 
@@ -56,18 +62,47 @@ class PositionManager:
     # ── Position sizing ───────────────────────────────────────
 
     def position_size(self, balance: float, price: float,
-                      segment: str, confidence: float) -> int:
+                      segment: str, confidence: float,
+                      kelly_pct: float = 0.0,
+                      rr_ratio:  float = 0.0) -> int:
         """
-        Allocates capital per slot, scaled by confidence.
-        FNO gets half the per-slot allocation of equity
-        because lot sizes already amplify exposure.
-        """
-        if segment == "EQUITY":
-            slot_alloc = balance / max(self.max_equity, 1)
-        else:
-            slot_alloc = balance / max(self.max_fno * 2, 1)
+        Priority:
+          1. Kelly % if available (real edge-based sizing)
+          2. Confidence-scaled slot allocation (fallback)
+        Both capped at MAX_PER_TRADE (10%) per trade.
 
-        allocated = slot_alloc * min(confidence, 1.0)
+        Month 1 (no history):
+          Kelly win_rate = 0.5 → Kelly% tiny → falls to confidence
+          confidence 75%, 3 slots → slot=33% → allocated 25% → capped 10%
+
+        Month 3+ (real WR known):
+          WR=72%, RR=2.3 → Half Kelly=29% → capped 10%
+          WR=45%, RR=2.0 → Half Kelly=5%  → 5% used (small bet)
+        """
+        if kelly_pct and kelly_pct > 0:
+            pct       = min(kelly_pct / 100, self.MAX_PER_TRADE)
+            allocated = balance * pct
+            logger.info(
+                f"Kelly sizing: {kelly_pct:.1f}% "
+                f"→ ₹{allocated:,.0f}"
+            )
+        else:
+            # Confidence-scaled slot allocation
+            if segment == "EQUITY":
+                slot_alloc = balance / max(self.max_equity, 1)
+            else:
+                slot_alloc = balance / max(self.max_fno * 2, 1)
+
+            conf_scale = min(confidence, 1.0)
+            allocated  = min(
+                slot_alloc * conf_scale,
+                balance * self.MAX_PER_TRADE
+            )
+            logger.info(
+                f"Confidence sizing: {confidence:.1%} "
+                f"→ ₹{allocated:,.0f}"
+            )
+
         return max(1, int(allocated / price))
 
     # ── Open / close ──────────────────────────────────────────
@@ -102,7 +137,8 @@ class PositionManager:
             else:
                 self.loss_count += 1
             logger.info(
-                f"📁 Closed: {pos['name']} | PnL ₹{pnl:+,.2f}"
+                f"📁 Closed: {pos['name']} | "
+                f"PnL ₹{pnl:+,.2f}"
             )
             return {**pos, "exit": exit_price, "pnl": pnl}
         return {}

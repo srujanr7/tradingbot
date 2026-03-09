@@ -151,8 +151,8 @@ def on_price_tick(token, ltp):
 
 
 def on_order_update(order):
-    status   = order["order_status"]
-    order_id = order["order_id"]
+    status   = order.get("order_status", "")
+    order_id = order.get("order_id", "")
     logger.info(f"📬 {order_id} → {status}")
     if status == "FAILED":
         notifier.error("OrderFailed", f"Order {order_id} rejected")
@@ -171,7 +171,39 @@ def is_market_open() -> bool:
     return config.MARKET_OPEN <= now <= config.MARKET_CLOSE
 
 
+def _ws_token_key(cfg: dict) -> str:
+    """
+    Extracts the bare integer token used as key in price_feed.latest_prices.
+
+    WS subscription uses "NSE:2885" format but the broker's response
+    returns instrument as just "2885" (confirmed from raw WS logs).
+    So we split on ":" and take the right side.
+    """
+    return cfg["ws_token"].split(":")[1]
+
+
+def _get_ltp_for_cfg(cfg: dict) -> float:
+    """
+    Gets LTP for an instrument, trying WebSocket cache first,
+    falling back to REST API.
+
+    WS cache is keyed by bare integer e.g. "2885".
+    REST fallback uses scrip_code in NSE_/NFO_ format.
+    """
+    ltp = price_feed.get_ltp(_ws_token_key(cfg))
+    if ltp is not None:
+        return float(ltp)
+    # REST fallback — get_ltp returns {scrip_code: price}
+    result = api.get_ltp(cfg["scrip_code"])
+    price  = result.get(cfg["scrip_code"]) if result else None
+    return float(price) if price is not None else None
+
+
 def get_candles(cfg: dict):
+    """
+    Fetches historical OHLCV candles for an instrument.
+    scrip_code is already in correct NSE_/NFO_ format from watchlist.py.
+    """
     trainer  = trainers.get(cfg["scrip_code"])
     interval = trainer.interval if trainer else config.CANDLE_INTERVAL
     end      = int(time.time() * 1000)
@@ -179,17 +211,13 @@ def get_candles(cfg: dict):
     return api.get_historical(cfg["scrip_code"], interval, start, end)
 
 
-def get_balance(segment: str) -> float:
+def get_balance() -> float:
     """
     Returns the true available balance for the current trade mode.
 
-    IMPORTANT: The broker returns the same underlying cash split
-    across multiple fields (eq_mis, future, option_buy etc).
-    These are NOT separate pools of money — never add them together.
-
-    We always use get_true_balance(TRADE_MODE) which picks exactly
-    one field matching the active mode, then caps at TRADE_CAPITAL
-    if the user has set a limit.
+    The broker returns the same underlying cash split across multiple
+    fields — never add them. get_true_balance picks exactly one field
+    matching TRADE_MODE, capped at TRADE_CAPITAL if set.
     """
     raw = api.get_true_balance(TRADE_MODE)
     return min(raw, TRADE_CAPITAL) if TRADE_CAPITAL else raw
@@ -209,10 +237,18 @@ def _interval_minutes(interval: str) -> int:
     return mapping.get(interval, 5)
 
 
+def _effective_segment(cfg: dict) -> str:
+    """
+    Returns the correct API segment string for an instrument.
+    DERIVATIVE instruments always use DERIVATIVE regardless of TRADE_MODE.
+    Equity instruments use EQUITY.
+    """
+    return cfg.get("segment", "EQUITY")
+
+
 def _passes_filters(cfg: dict) -> tuple:
     """
-    Checks ACTIVE_SEGMENT, ACTIVE_EXCHANGE, ACTIVE_INSTRUMENT
-    against the instrument config dict.
+    Checks ACTIVE_SEGMENT, ACTIVE_EXCHANGE, ACTIVE_INSTRUMENT.
     Returns (passes: bool, reason: str).
     """
     seg       = cfg.get("segment", "EQUITY")
@@ -223,32 +259,24 @@ def _passes_filters(cfg: dict) -> tuple:
         return False, f"segment filter active (EQUITY only, got {seg})"
     if ACTIVE_SEGMENT == "FNO" and seg != "DERIVATIVE":
         return False, f"segment filter active (FNO only, got {seg})"
-
     if ACTIVE_EXCHANGE == "NSE" and exchange != "NSE":
         return False, f"exchange filter active (NSE only, got {exchange})"
     if ACTIVE_EXCHANGE == "BSE" and exchange != "BSE":
         return False, f"exchange filter active (BSE only, got {exchange})"
-
     if ACTIVE_INSTRUMENT != "ALL" and inst_type != ACTIVE_INSTRUMENT:
         return False, (
             f"instrument filter active ({ACTIVE_INSTRUMENT} only, "
             f"got {inst_type})"
         )
-
     return True, ""
 
 
-# ── SL/TP Monitor — runs first every cycle ────────────────────
+# ── SL/TP Monitor ─────────────────────────────────────────────
 
 def _monitor_open_positions(active: list):
     """
-    Checks every open position for:
-      1. Hard stop loss
-      2. Take profit
-      3. Trailing stop
-      4. Time exit (> 2 hours)
-    Exits immediately if any condition is met.
-    Runs BEFORE scanning for new entries.
+    Checks every open position for hard SL, TP, trailing stop,
+    and 2-hour time exit. Runs BEFORE scanning for new entries.
     """
     for scrip_code, pos in list(posmgr.positions.items()):
         meta = pos.get("signal_meta", {})
@@ -260,11 +288,7 @@ def _monitor_open_positions(active: list):
         if not cfg:
             continue
 
-        token = cfg["ws_token"].split(":")[1]
-        ltp   = price_feed.get_ltp(token)
-        if ltp is None:
-            data = api.get_ltp(scrip_code)
-            ltp  = data.get(scrip_code)
+        ltp = _get_ltp_for_cfg(cfg)
         if not ltp:
             continue
 
@@ -274,13 +298,11 @@ def _monitor_open_positions(active: list):
         take_profit = meta.get("take_profit", entry * 1.02)
         trailing    = meta.get("trailing")
 
-        # Track max drawdown live
         current_dd = max(0.0, (entry - ltp) / entry * 100)
         meta["max_drawdown"] = max(
             meta.get("max_drawdown", 0.0), current_dd
         )
 
-        # Trailing stop update
         trail_exit = False
         locked_pnl = 0.0
         if trailing:
@@ -329,7 +351,6 @@ def run_cycle():
         logger.warning("⚠️ Token invalid — skipping cycle.")
         return
 
-    # VIX gate
     if _vix_data["stop_trade"]:
         logger.info(
             f"🔴 VIX {_vix_data['vix']:.1f} ≥ 25 — trading paused"
@@ -348,7 +369,6 @@ def run_cycle():
 
     def scan_instrument(cfg):
         try:
-            # Filter check — runs on every instrument
             passes, filter_reason = _passes_filters(cfg)
             if not passes:
                 logger.debug(
@@ -357,11 +377,7 @@ def run_cycle():
                 return
 
             if posmgr.has_position(cfg["scrip_code"]):
-                token = cfg["ws_token"].split(":")[1]
-                ltp   = price_feed.get_ltp(token)
-                if ltp is None:
-                    data = api.get_ltp(cfg["scrip_code"])
-                    ltp  = data.get(cfg["scrip_code"])
+                ltp = _get_ltp_for_cfg(cfg)
                 if ltp:
                     df = get_candles(cfg)
                     if df is not None and len(df) >= 30:
@@ -375,11 +391,7 @@ def run_cycle():
                             })
                 return
 
-            token = cfg["ws_token"].split(":")[1]
-            ltp   = price_feed.get_ltp(token)
-            if ltp is None:
-                data = api.get_ltp(cfg["scrip_code"])
-                ltp  = data.get(cfg["scrip_code"])
+            ltp = _get_ltp_for_cfg(cfg)
             if not ltp:
                 return
 
@@ -479,16 +491,12 @@ def run_cycle():
 
 def process_entry(cfg: dict, result: dict, ltp: float):
 
-    # Segment / exchange / instrument filter (hard gate)
     passes, filter_reason = _passes_filters(cfg)
     if not passes:
-        logger.info(
-            f"[{cfg['name']}] Entry blocked — {filter_reason}"
-        )
+        logger.info(f"[{cfg['name']}] Entry blocked — {filter_reason}")
         return
 
-    # ── FIXED: use single true balance, never add segments ──
-    balance = get_balance(cfg["segment"])
+    balance = get_balance()
 
     if not risk.can_trade(balance):
         notifier.kill_switch(
@@ -500,22 +508,20 @@ def process_entry(cfg: dict, result: dict, ltp: float):
     if risk.daily_pnl < -(limit * 0.8):
         notifier.risk_warning(risk.daily_pnl, limit, balance)
 
-    # ── FIXED: use margin API for real position sizing ──────
-    # Ask broker: how much margin do I need for 1 unit?
-    effective_segment = (
-        "DERIVATIVE" if TRADE_MODE == "MARGIN"
-        else cfg.get("segment", "EQUITY")
-    )
+    # Segment and product — derived from instrument, not TRADE_MODE
+    segment = _effective_segment(cfg)
+    product = api._api_product(TRADE_MODE, segment)
+
+    # Margin per unit for sizing
     margin_per_unit = api.get_margin_per_unit(
         security_id = cfg["security_id"],
         price       = ltp,
-        segment     = effective_segment,
+        segment     = segment,
         txn_type    = "BUY",
-        product     = TRADE_MODE,   # _api_product() converts this internally
-        exchange    = cfg.get("exchange", "NSE")
+        product     = product,
+        exchange    = cfg.get("exchange", "NSE"),
     )
 
-    # Fallback: if margin API fails, use raw price (no leverage)
     if margin_per_unit <= 0:
         logger.warning(
             f"[{cfg['name']}] Margin API returned 0, "
@@ -523,18 +529,17 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         )
         margin_per_unit = ltp
 
-    # Now size using actual margin cost per unit
     qty = posmgr.position_size(
         balance    = balance,
-        price      = margin_per_unit,   # ← margin per unit, not raw price
-        segment    = effective_segment,
+        price      = margin_per_unit,
+        segment    = segment,
         confidence = result["confidence"],
         kelly_pct  = result.get("kelly_pct", 0.0),
         rr_ratio   = result.get("rr_ratio",  0.0),
     )
     qty = risk.apply_per_trade_limit(qty, margin_per_unit)
 
-    # VIX position size scaling
+    # VIX size scaling
     if _vix_data["multiplier"] < 1.0:
         original_qty = qty
         qty = max(1, int(qty * _vix_data["multiplier"]))
@@ -544,18 +549,21 @@ def process_entry(cfg: dict, result: dict, ltp: float):
             f"(×{_vix_data['multiplier']})"
         )
 
-    # Final margin check: can we actually afford this qty?
+    # Final margin check for full qty
     margin = api.check_margin(
         security_id = cfg["security_id"],
         qty         = qty,
         price       = ltp,
-        segment     = effective_segment,
+        segment     = segment,
         txn_type    = "BUY",
-        product     = api._api_product(TRADE_MODE, effective_segment),
-        exchange    = cfg.get("exchange", "NSE")
+        product     = product,
+        exchange    = cfg.get("exchange", "NSE"),
     )
     if margin:
-        required = margin.get("total_margin", 0)
+        required = float(margin.get("total_margin", 0))
+        charges  = float(
+            margin.get("charges", {}).get("total_charges", 0)
+        )
         if required > balance:
             notifier.insufficient_margin(
                 cfg["name"], required, balance
@@ -568,7 +576,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         logger.info(
             f"[{cfg['name']}] Margin OK: "
             f"₹{required:,.0f} / ₹{balance:,.0f} available | "
-            f"Charges: ₹{margin.get('charges', {}).get('total_charges', 0):.2f}"
+            f"Charges: ₹{charges:.2f}"
         )
 
     order = api.place_order(
@@ -576,21 +584,20 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         security_id = cfg["security_id"],
         qty         = qty,
         order_type  = "LIMIT",
-        limit_price = round(
-            ltp * (1 + config.LIMIT_ORDER_SLIPPAGE), 2
-        ),
-        segment     = effective_segment,
-        product     = api._api_product(TRADE_MODE, effective_segment),
-        exchange    = cfg["exchange"]
+        limit_price = round(ltp * (1 + config.LIMIT_ORDER_SLIPPAGE), 2),
+        segment     = segment,
+        product     = product,
+        exchange    = cfg.get("exchange", "NSE"),
+        algo_id     = config.ALGO_ID,
     )
 
     if order:
         fill      = order_feed.wait_for_fill(
             order["order_id"],
             timeout = config.ORDER_FILL_TIMEOUT,
-            segment = effective_segment
+            segment = segment,
         )
-        avg_price = fill.get("average_price", ltp)
+        avg_price = fill.get("average_price") or ltp
 
         if fill.get("order_status") == "FAILED":
             notifier.order_failed(
@@ -601,12 +608,12 @@ def process_entry(cfg: dict, result: dict, ltp: float):
 
         stop_loss   = result.get("stop_loss")  or round(avg_price * 0.99, 2)
         take_profit = result.get("take_profit") or round(avg_price * 1.02, 2)
-        atr_val     = result.get("atr") or avg_price * 0.01
+        atr_val     = result.get("atr")         or avg_price * 0.01
 
         trailing = TrailingStop(
             entry            = avg_price,
             atr              = atr_val,
-            trail_multiplier = 1.5
+            trail_multiplier = 1.5,
         )
 
         sl_pct = result.get("sl_pct") or (
@@ -619,7 +626,7 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         posmgr.open_position(
             scrip_code  = cfg["scrip_code"],
             name        = cfg["name"],
-            segment     = effective_segment,
+            segment     = segment,
             qty         = qty,
             entry_price = avg_price,
             order_id    = order["order_id"],
@@ -635,16 +642,16 @@ def process_entry(cfg: dict, result: dict, ltp: float):
         notifier.trade_executed(
             side        = "BUY",
             name        = cfg["name"],
-            segment     = effective_segment,
+            segment     = segment,
             qty         = qty,
             price       = avg_price,
             confidence  = result["confidence"],
-            xgb         = result.get("xgb", ""),
-            rl          = result.get("rl", ""),
+            xgb         = result.get("xgb",  ""),
+            rl          = result.get("rl",   ""),
             lgbm        = result.get("lgbm", ""),
             lstm        = result.get("lstm", ""),
             pattern     = result.get("pattern", "NONE"),
-            regime      = result.get("regime", ""),
+            regime      = result.get("regime",  ""),
             stop_loss   = stop_loss,
             take_profit = take_profit,
             rr_ratio    = result.get("rr_ratio", 0),
@@ -661,28 +668,30 @@ def process_exit(cfg: dict, ltp: float,
     if not pos:
         return
 
+    segment = pos["segment"]
+    product = api._api_product(TRADE_MODE, segment)
+
     order = api.place_order(
         txn_type    = "SELL",
         security_id = cfg["security_id"],
         qty         = pos["qty"],
         order_type  = "MARKET",
-        segment     = pos["segment"],
-        product     = api._api_product(TRADE_MODE, pos["segment"]),
-        exchange    = cfg["exchange"]
+        segment     = segment,
+        product     = product,
+        exchange    = cfg.get("exchange", "NSE"),
+        algo_id     = config.ALGO_ID,
     )
 
     if order:
         fill       = order_feed.wait_for_fill(
             order["order_id"],
             timeout = config.ORDER_FILL_TIMEOUT,
-            segment = pos["segment"]
+            segment = segment,
         )
-        exit_price = fill.get("average_price", ltp)
-        closed     = posmgr.close_position(
-            cfg["scrip_code"], exit_price
-        )
-        pnl     = closed.get("pnl", 0)
-        pnl_pct = (
+        exit_price = fill.get("average_price") or ltp
+        closed     = posmgr.close_position(cfg["scrip_code"], exit_price)
+        pnl        = closed.get("pnl", 0)
+        pnl_pct    = (
             (exit_price - pos["entry"]) / pos["entry"] * 100
             if pos["entry"] else 0
         )
@@ -722,7 +731,7 @@ def process_exit(cfg: dict, ltp: float,
         trade_memory.record({
             "scrip_code":       cfg["scrip_code"],
             "name":             cfg["name"],
-            "segment":          pos["segment"],
+            "segment":          segment,
             "side":             "BUY",
             "entry":            pos["entry"],
             "exit":             exit_price,
@@ -731,21 +740,19 @@ def process_exit(cfg: dict, ltp: float,
             "pnl_pct":          round(pnl_pct, 3),
             "profitable":       pnl >= 0,
             "held_candles":     held_candles,
-            "max_drawdown_pct": round(
-                meta.get("max_drawdown", 0.0), 3
-            ),
+            "max_drawdown_pct": round(meta.get("max_drawdown", 0.0), 3),
             "exit_reason":      reason,
             "stop_loss":        meta.get("stop_loss"),
             "take_profit":      meta.get("take_profit"),
             "confidence":       meta.get("confidence", 0),
-            "xgb":              meta.get("xgb", ""),
+            "xgb":              meta.get("xgb",  ""),
             "lgbm":             meta.get("lgbm", ""),
             "lstm":             meta.get("lstm", ""),
-            "rl":               meta.get("rl", ""),
-            "pattern":          meta.get("pattern", ""),
-            "regime":           meta.get("regime", ""),
+            "rl":               meta.get("rl",   ""),
+            "pattern":          meta.get("pattern",  ""),
+            "regime":           meta.get("regime",   ""),
             "sentiment":        meta.get("sentiment", 0),
-            "rr_ratio":         meta.get("rr_ratio", 0),
+            "rr_ratio":         meta.get("rr_ratio",  0),
             "ev_quality":       meta.get("ev_quality", ""),
             "interval":         interval_key,
             "vix":              _vix_data["vix"],
@@ -777,11 +784,7 @@ def square_off_all():
             None
         )
         if cfg:
-            ltp = (
-                price_feed.get_ltp(
-                    cfg["ws_token"].split(":")[1]
-                ) or pos["entry"]
-            )
+            ltp = _get_ltp_for_cfg(cfg) or pos["entry"]
             process_exit(cfg, ltp, reason="AUTO_SQUAREOFF")
 
 
@@ -817,13 +820,11 @@ def daily_reset():
         logger.info(
             f"VIX normal ({_vix_data['vix']:.1f}) — full size trading"
         )
-
     logger.info("🔄 Daily counters reset")
 
 
 def send_daily_summary():
-    # ── FIXED: use single true balance, never add segments ──
-    balance = api.get_true_balance(TRADE_MODE)
+    balance = get_balance()
     status  = posmgr.status()
     notifier.daily_summary(
         total_pnl = risk.daily_pnl,

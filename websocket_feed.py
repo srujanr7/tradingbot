@@ -27,6 +27,7 @@ class PriceFeed:
         self.ws            = None
         self._running      = False
         self.latest_prices = {}
+        self._logged_count = 0   # for raw message diagnostics
 
     def _on_open(self, ws):
         logger.info("✅ Price feed connected")
@@ -38,22 +39,65 @@ class PriceFeed:
 
     def _on_message(self, ws, message):
         try:
+            # Log first 3 raw messages to help diagnose broker format
+            if self._logged_count < 3:
+                logger.info(f"RAW WS MESSAGE #{self._logged_count + 1}: {message[:500]}")
+                self._logged_count += 1
+
             data = json.loads(message)
-            if "mode" not in data:
+
+            # Handle double-encoded JSON (broker sends a JSON string inside a string)
+            if isinstance(data, str):
+                data = json.loads(data)
+
+            # Handle list payloads (some brokers batch multiple ticks in one message)
+            if isinstance(data, list):
+                for item in data:
+                    self._process_tick(item)
                 return
-            if data["mode"] == "ltp":
-                token = data["instrument"]
-                ltp   = data["data"]["ltp"]
-                self.latest_prices[token] = ltp
-                if self.on_tick:
-                    self.on_tick(token, ltp)
-            elif data["mode"] == "quote":
-                token = data["instrument"]
-                self.latest_prices[token] = data["data"].get("live_price")
-                if self.on_tick:
-                    self.on_tick(token, data["data"])
+
+            self._process_tick(data)
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Price feed JSON decode error: {e} | raw={message[:200]}")
         except Exception as e:
-            logger.error(f"Price feed parse error: {e}")
+            logger.error(f"Price feed message error: {e} | raw={message[:200]}")
+
+    def _process_tick(self, data):
+        """
+        Process a single normalised tick dict.
+        Handles both 'ltp' and 'quote' modes.
+        Silently ignores non-dict payloads (e.g. heartbeats).
+        """
+        try:
+            if not isinstance(data, dict):
+                return
+
+            mode = data.get("mode")
+            if not mode:
+                return
+
+            if mode == "ltp":
+                token = data.get("instrument")
+                ltp   = data.get("data", {}).get("ltp")
+                if token is None or ltp is None:
+                    return
+                self.latest_prices[token] = float(ltp)
+                if self.on_tick:
+                    self.on_tick(token, float(ltp))
+
+            elif mode == "quote":
+                token = data.get("instrument")
+                price = data.get("data", {}).get("live_price")
+                if token is None:
+                    return
+                if price is not None:
+                    self.latest_prices[token] = float(price)
+                if self.on_tick:
+                    self.on_tick(token, data.get("data", {}))
+
+        except Exception as e:
+            logger.error(f"Tick processing error: {e} | data={str(data)[:200]}")
 
     def _on_error(self, ws, error):
         logger.error(f"Price feed error: {error}")

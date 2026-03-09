@@ -226,7 +226,8 @@ class FullMarketScanner:
         try:
             filtered = df[
                 (df["INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX"])) &
-                (df["EXPIRY_FLAG"] == "M")
+                (df["EXPIRY_FLAG"] == "M") &
+                (pd.to_datetime(df["EXPIRY_DATE"]) >= pd.Timestamp.today())
             ].copy()
         except Exception as e:
             logger.error(f"FNO filter error: {e}")
@@ -526,4 +527,5 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
+
 

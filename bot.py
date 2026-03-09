@@ -201,24 +201,25 @@ def _get_ltp_for_cfg(cfg: dict) -> float:
 
 def get_candles(cfg: dict):
     """
-    Fetch historical candles using correct API parameters.
+    Fetch historical OHLCV candles using INDstocks API.
     """
 
-    trainer  = trainers.get(cfg["scrip_code"])
+    trainer = trainers.get(cfg["scrip_code"])
     interval = trainer.interval if trainer else config.CANDLE_INTERVAL
 
-    end   = int(time.time() * 1000)
-    start = end - (5 * 24 * 60 * 60 * 1000)
+    end_time = int(time.time() * 1000)
 
-    time.sleep(0.25)  # API throttle
+    # 6 days keeps us safely under the 7-day API limit for 1minute candles
+    start_time = end_time - (6 * 24 * 60 * 60 * 1000)
+
+    # Prevent API rate limits
+    time.sleep(0.25)
 
     return api.get_historical(
-        security_id = cfg["security_id"],
-        segment     = cfg["segment"],
-        exchange    = cfg.get("exchange", "NSE"),
-        interval    = interval,
-        start       = start,
-        end         = end
+        cfg["scrip_code"],
+        interval,
+        start_time,
+        end_time
     )
 
 

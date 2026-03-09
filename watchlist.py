@@ -37,7 +37,7 @@ class FullMarketScanner:
     MIN_PRICE_EQUITY = 50.0
     MIN_PRICE_FNO    = 1.0
     TIER1_INTERVAL   = 30 * 60
-    BATCH_SIZE       = 100   # safe limit for GET query string length
+    BATCH_SIZE       = 80   # safe limit for GET query string length
 
     def __init__(self, api: INDstocksAPI,
                  top_n_equity: int = 10,
@@ -368,7 +368,11 @@ class FullMarketScanner:
 
         for i in range(0, total, self.BATCH_SIZE):
             batch       = instruments[i:i + self.BATCH_SIZE]
-            scrip_codes = ",".join(inst["scrip_code"] for inst in batch)
+            scrip_codes = ",".join(
+                inst["scrip_code"]
+                for inst in batch
+                if inst["scrip_code"].startswith("NSE_")
+            )
             batch_num   = i // self.BATCH_SIZE + 1
 
             try:
@@ -553,6 +557,7 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
+
 
 
 

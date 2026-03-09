@@ -361,8 +361,8 @@ def _monitor_open_positions(active: list):
 
 def run_cycle():
     if not is_market_open():
-    logger.info("⏸ Market closed — skipping cycle.")
-    return
+        logger.info("⏸ Market closed — skipping cycle.")
+        return
     if notifier.bot_paused:
         logger.info("Bot paused via Telegram.")
         return

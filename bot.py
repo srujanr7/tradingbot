@@ -201,14 +201,25 @@ def _get_ltp_for_cfg(cfg: dict) -> float:
 
 def get_candles(cfg: dict):
     """
-    Fetches historical OHLCV candles for an instrument.
-    scrip_code is already in correct NSE_/NFO_ format from watchlist.py.
+    Fetch historical candles using correct API parameters.
     """
+
     trainer  = trainers.get(cfg["scrip_code"])
     interval = trainer.interval if trainer else config.CANDLE_INTERVAL
-    end      = int(time.time() * 1000)
-    start    = end - (5 * 24 * 60 * 60 * 1000)
-    return api.get_historical(cfg["scrip_code"], interval, start, end)
+
+    end   = int(time.time() * 1000)
+    start = end - (5 * 24 * 60 * 60 * 1000)
+
+    time.sleep(0.25)  # API throttle
+
+    return api.get_historical(
+        security_id = cfg["security_id"],
+        segment     = cfg["segment"],
+        exchange    = cfg.get("exchange", "NSE"),
+        interval    = interval,
+        start       = start,
+        end         = end
+    )
 
 
 def get_balance() -> float:

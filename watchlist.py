@@ -240,7 +240,7 @@ class FullMarketScanner:
                 sid  = str(row["SECURITY_ID"]).strip()
                 base = self._best_name(row, fallback=sid)
                 instruments.append({
-                    "name":            f"{base} Fut",
+                    "name":            f"{base} Future",
                     "scrip_code":      f"NFO_{sid}",
                     "security_id":     sid,
                     "ws_token":        f"NFO:{sid}",
@@ -526,3 +526,4 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
+

@@ -198,29 +198,35 @@ def _get_ltp_for_cfg(cfg: dict) -> float:
     price  = result.get(cfg["scrip_code"]) if result else None
     return float(price) if price is not None else None
 
-
+CANDLE_CACHE = {}
 def get_candles(cfg: dict):
-    """
-    Fetch historical OHLCV candles using INDstocks API.
-    """
+
+    key = cfg["scrip_code"]
+
+    # return cached candles if fresh
+    if key in CANDLE_CACHE:
+        ts, data = CANDLE_CACHE[key]
+        if time.time() - ts < 60:
+            return data
 
     trainer = trainers.get(cfg["scrip_code"])
     interval = trainer.interval if trainer else config.CANDLE_INTERVAL
 
     end_time = int(time.time() * 1000)
-
-    # 6 days keeps us safely under the 7-day API limit for 1minute candles
     start_time = end_time - (6 * 24 * 60 * 60 * 1000)
 
-    # Prevent API rate limits
     time.sleep(0.25)
 
-    return api.get_historical(
+    df = api.get_historical(
         cfg["scrip_code"],
         interval,
         start_time,
         end_time
     )
+
+    CANDLE_CACHE[key] = (time.time(), df)
+
+    return df
 
 
 def get_balance() -> float:

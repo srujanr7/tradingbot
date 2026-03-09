@@ -890,8 +890,11 @@ if __name__ == "__main__":
     notifier.bot_started()
 
     logger.info("✅ All systems running")
-    logger.info("⏳ Waiting 3 minutes for initial model training...")
-    time.sleep(180)
+    logger.info("⏳ Waiting 30 seconds for initial model warmup...")
+    time.sleep(30)
+    
+    logger.info("🚀 Running first trading cycle...")
+    run_cycle()
 
     while True:
         try:

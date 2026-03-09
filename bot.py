@@ -364,7 +364,7 @@ def run_cycle():
 
     _monitor_open_positions(active)
 
-    signals      = []
+    signals = []
     exit_signals = []
 
     def scan_instrument(cfg):
@@ -384,9 +384,9 @@ def run_cycle():
                         result = get_trainer(cfg).get_signal(df)
                         if result["signal"] == "SELL":
                             exit_signals.append({
-                                "cfg":    cfg,
+                                "cfg": cfg,
                                 "result": result,
-                                "ltp":    ltp,
+                                "ltp": ltp,
                                 "reason": "MODEL_SELL_SIGNAL"
                             })
                 return
@@ -396,9 +396,11 @@ def run_cycle():
                 return
 
             df = get_candles(cfg)
+
             if df is None or len(df) < 30:
-                time.sleep(2)
+                time.sleep(1)
                 df = get_candles(cfg)
+
             if df is None or len(df) < 30:
                 logger.warning(
                     f"[{cfg['name']}] Insufficient candles, skipping."
@@ -407,57 +409,31 @@ def run_cycle():
 
             result = get_trainer(cfg).get_signal(df)
 
-            sl_tp_str = ""
-            if result.get("stop_loss"):
-                sl_tp_str = (
-                    f" | SL=₹{result['stop_loss']} "
-                    f"TP=₹{result['take_profit']} "
-                    f"RR={result.get('rr_ratio', 0):.1f}"
-                )
-
-            vix_str = (
-                f" | VIX={_vix_data['vix']:.1f}"
-                f"{'⚠️' if _vix_data['half_size'] else ''}"
-            )
-
-            logger.info(
-                f"[{cfg['name']}] ₹{ltp} | "
-                f"{result['signal']} {result['confidence']:.1%} | "
-                f"XGB={result.get('xgb','')} "
-                f"LGBM={result.get('lgbm','')} "
-                f"LSTM={result.get('lstm','')} "
-                f"RL={result.get('rl','')} | "
-                f"Pattern={result.get('pattern','NONE')} "
-                f"Regime={result.get('regime','')}"
-                f"{sl_tp_str}{vix_str}"
-            )
-
             if result["signal"] == "BUY":
                 signals.append({
-                    "cfg": cfg, "result": result, "ltp": ltp
+                    "cfg": cfg,
+                    "result": result,
+                    "ltp": ltp
                 })
 
         except Exception as e:
             logger.error(f"Scan error [{cfg['name']}]: {e}")
 
-    threads = [
-        threading.Thread(
-            target=scan_instrument, args=(cfg,), daemon=True
-        )
-        for cfg in active
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=15)
+    # ⭐ FIXED SCANNER (no threading → avoids API rate limit)
+    for cfg in active:
+        scan_instrument(cfg)
+        time.sleep(0.25)
 
+    # Process exits
     for entry in exit_signals:
         process_exit(
-            entry["cfg"], entry["ltp"],
+            entry["cfg"],
+            entry["ltp"],
             reason=entry.get("reason", "MODEL_SELL_SIGNAL")
         )
 
     ranked = posmgr.rank_signals(signals)
+
     logger.info(
         f"📊 {len(ranked)} actionable | "
         f"EQ={posmgr.equity_slots_free()} free | "
@@ -469,23 +445,27 @@ def run_cycle():
             entry["cfg"]["segment"],
             entry["result"]["confidence"]
         )
+
         if not can_enter:
             logger.info(
                 f"[{entry['cfg']['name']}] Skipped: {reason}"
             )
             continue
+
         process_entry(
-            entry["cfg"], entry["result"], entry["ltp"]
+            entry["cfg"],
+            entry["result"],
+            entry["ltp"]
         )
 
     status = posmgr.status()
+
     logger.info(
         f"📁 Open={status['open_positions']} | "
         f"EQ={status['equity_open']}/{MAX_EQUITY_POS} | "
         f"FNO={status['fno_open']}/{MAX_FNO_POS} | "
         f"WR={status['win_rate']:.1f}%"
     )
-
 
 # ── Entry ─────────────────────────────────────────────────────
 

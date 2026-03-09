@@ -30,6 +30,7 @@ class FullMarketScanner:
     MIN_PRICE_EQUITY = 50.0
     MIN_PRICE_FNO    = 1.0
     TIER1_INTERVAL   = 30 * 60
+    BATCH_SIZE       = 100   # safe limit for GET query string length
 
     def __init__(self, api: INDstocksAPI,
                  top_n_equity: int = 10,
@@ -145,15 +146,16 @@ class FullMarketScanner:
                     sid
                 )
                 instruments.append({
-                    "name":        name,
-                    "scrip_code":  f"NSE_{sid}",
-                    "security_id": sid,
-                    "ws_token":    f"NSE:{sid}",
-                    "segment":     "EQUITY",
-                    "product":     "CNC",
-                    "exchange":    "NSE",
-                    "tick_size":   float(row.get("TICK_SIZE", 0.05)),
-                    "lot_units":   int(row.get("LOT_UNITS", 1)),
+                    "name":            name,
+                    "scrip_code":      f"NSE_{sid}",
+                    "security_id":     sid,
+                    "ws_token":        f"NSE:{sid}",
+                    "segment":         "EQUITY",
+                    "product":         "CNC",
+                    "exchange":        "NSE",
+                    "instrument_type": "EQUITY",
+                    "tick_size":       float(row.get("TICK_SIZE", 0.05)),
+                    "lot_units":       int(row.get("LOT_UNITS", 1)),
                 })
             except Exception as e:
                 logger.warning(f"Skipping equity row: {e}")
@@ -190,17 +192,19 @@ class FullMarketScanner:
                     row.get("TRADING_SYMBOL") or
                     sid
                 )
+                inst_name = str(row.get("INSTRUMENT_NAME", "FUTSTK"))
                 instruments.append({
-                    "name":        f"{name} Fut",
-                    "scrip_code":  f"NFO_{sid}",   # REST quotes: NFO_51011
-                    "security_id": sid,
-                    "ws_token":    f"NFO:{sid}",   # WebSocket: NFO:51011
-                    "segment":     "DERIVATIVE",
-                    "product":     "MARGIN",
-                    "exchange":    "NSE",
-                    "lot_size":    int(row.get("LOT_UNITS", 1)),
-                    "expiry":      str(row.get("EXPIRY_DATE", "")),
-                    "tick_size":   float(row.get("TICK_SIZE", 0.05)),
+                    "name":            f"{name} Fut",
+                    "scrip_code":      f"NFO_{sid}",
+                    "security_id":     sid,
+                    "ws_token":        f"NFO:{sid}",
+                    "segment":         "DERIVATIVE",
+                    "product":         "MARGIN",
+                    "exchange":        "NSE",
+                    "instrument_type": "FUTURES",
+                    "lot_size":        int(row.get("LOT_UNITS", 1)),
+                    "expiry":          str(row.get("EXPIRY_DATE", "")),
+                    "tick_size":       float(row.get("TICK_SIZE", 0.05)),
                 })
             except Exception as e:
                 logger.warning(f"Skipping FNO row: {e}")
@@ -238,13 +242,14 @@ class FullMarketScanner:
             try:
                 sid = str(row["SECURITY_ID"])
                 instruments.append({
-                    "name":        str(row[name_col]),
-                    "scrip_code":  f"NIDX_{sid}",
-                    "security_id": sid,
-                    "ws_token":    f"NIDX:{sid}",
-                    "segment":     "INDEX",
-                    "product":     None,
-                    "exchange":    "NSE",
+                    "name":            str(row[name_col]),
+                    "scrip_code":      f"NIDX_{sid}",
+                    "security_id":     sid,
+                    "ws_token":        f"NIDX:{sid}",
+                    "segment":         "INDEX",
+                    "product":         None,
+                    "exchange":        "NSE",
+                    "instrument_type": "INDEX",
                 })
             except Exception as e:
                 logger.warning(f"Skipping index row: {e}")
@@ -290,7 +295,7 @@ class FullMarketScanner:
                      min_price: float,
                      top_n: int) -> list:
         """
-        Batch-fetch quotes for up to 500 instruments at a time.
+        Batch-fetch quotes for up to BATCH_SIZE instruments at a time.
         Score by volume + volatility + momentum.
         Return top N scored instruments.
         scrip_code format NSE_TOKEN / NFO_TOKEN matches API docs exactly.
@@ -299,20 +304,31 @@ class FullMarketScanner:
             return []
 
         scored     = []
-        batch_size = 500
+        batch_size = self.BATCH_SIZE
+        total      = len(instruments)
 
-        for i in range(0, len(instruments), batch_size):
+        for i in range(0, total, batch_size):
             batch       = instruments[i:i + batch_size]
             scrip_codes = ",".join([inst["scrip_code"] for inst in batch])
+            batch_num   = i // batch_size + 1
+            total_batches = (total + batch_size - 1) // batch_size
 
             try:
                 quotes = self.api._request(
                     "GET", "/market/quotes/full",
                     params={"scrip-codes": scrip_codes}
                 )
+
                 if not quotes or "data" not in quotes:
+                    logger.warning(
+                        f"Batch {batch_num}/{total_batches}: "
+                        f"empty/bad response "
+                        f"(sample: {scrip_codes[:60]}...)"
+                    )
+                    time.sleep(0.5)
                     continue
 
+                hits = 0
                 for inst in batch:
                     code = inst["scrip_code"]
                     data = quotes["data"].get(code, {})
@@ -337,25 +353,35 @@ class FullMarketScanner:
                     )
                     atr_score = min(atr_pct * 10, 40)
                     mom_score = min(change * 4, 20)
-                    total     = vol_score + atr_score + mom_score
+                    total_score = vol_score + atr_score + mom_score
 
                     scored.append({
                         **inst,
-                        "score":  round(total, 2),
+                        "score":  round(total_score, 2),
                         "ltp":    price,
                         "volume": volume,
                         "change": change
                     })
+                    hits += 1
+
+                logger.debug(
+                    f"Batch {batch_num}/{total_batches}: "
+                    f"{hits}/{len(batch)} instruments scored"
+                )
 
             except Exception as e:
                 logger.error(
-                    f"Batch score error "
-                    f"(sample code: {scrip_codes[:30]}...): {e}"
+                    f"Batch {batch_num}/{total_batches} score error "
+                    f"(sample: {scrip_codes[:60]}...): {e}"
                 )
 
             time.sleep(0.5)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        logger.info(
+            f"Scoring complete: {len(scored)} passed filters, "
+            f"returning top {min(top_n, len(scored))}"
+        )
         return scored[:top_n]
 
     # ── Public API ────────────────────────────────────────────

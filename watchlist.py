@@ -17,12 +17,19 @@ class FullMarketScanner:
     Tier 1 (every 30 min):
       - Downloads full instruments CSV from API
       - Filters by liquidity, segment, series
-      - Quick-scores all stocks by volume + momentum
-      - Shortlists top 50 candidates
+      - Equity scored via quotes API (NSE_ prefix confirmed working)
+      - FNO shortlisted from CSV only (quotes API rejects NFO_ prefix)
+      - Shortlists top 50 equity + top 10 FNO
 
     Tier 2 (every 60 sec, called by bot.py):
       - Runs ML signals only on shortlisted candidates
       - Returns ranked actionable signals
+
+    CSV columns (confirmed from API docs):
+      EXCH, SEGMENT, SECURITY_ID, INSTRUMENT_NAME, EXPIRY_CODE,
+      TRADING_SYMBOL, LOT_UNITS, CUSTOM_SYMBOL, EXPIRY_DATE,
+      STRIKE_PRICE, OPTION_TYPE, TICK_SIZE, EXPIRY_FLAG,
+      SEM_EXCH_INSTRUMENT_TYPE, SERIES, SYMBOL_NAME
     """
 
     TIER1_SHORTLIST  = 50
@@ -60,6 +67,9 @@ class FullMarketScanner:
         try:
             equity_df = self._fetch_instruments("equity")
             if equity_df is not None:
+                logger.info(
+                    f"Equity CSV columns: {equity_df.columns.tolist()}"
+                )
                 self.universe_equity = self._parse_equity(equity_df)
                 logger.info(
                     f"✅ Equity universe: "
@@ -71,6 +81,9 @@ class FullMarketScanner:
         try:
             fno_df = self._fetch_instruments("fno")
             if fno_df is not None:
+                logger.info(
+                    f"FNO CSV columns: {fno_df.columns.tolist()}"
+                )
                 self.universe_fno = self._parse_fno(fno_df)
                 logger.info(
                     f"✅ FNO universe: "
@@ -82,6 +95,9 @@ class FullMarketScanner:
         try:
             index_df = self._fetch_instruments("index")
             if index_df is not None:
+                logger.info(
+                    f"Index CSV columns: {index_df.columns.tolist()}"
+                )
                 self.universe_index = self._parse_index(index_df)
                 logger.info(
                     f"✅ Index universe: "
@@ -121,30 +137,51 @@ class FullMarketScanner:
             logger.error(f"Instruments fetch error ({source}): {e}")
             return None
 
+    def _best_name(self, row, fallback: str) -> str:
+        """
+        Pick the most human-readable name from a CSV row.
+        Priority: SYMBOL_NAME → CUSTOM_SYMBOL → TRADING_SYMBOL → fallback
+        """
+        for col in ("SYMBOL_NAME", "CUSTOM_SYMBOL", "TRADING_SYMBOL"):
+            val = row.get(col)
+            if val and str(val).strip() and str(val).strip() != "nan":
+                return str(val).strip()
+        return fallback
+
     def _parse_equity(self, df: pd.DataFrame) -> list:
+        """
+        Filter: EXCH=NSE, SERIES=EQ, INSTRUMENT_NAME=EQUITY
+        scrip_code → NSE_<SECURITY_ID>  (confirmed working with quotes API)
+        ws_token   → NSE:<SECURITY_ID>  (confirmed from WS docs)
+        """
         df.columns = df.columns.str.strip()
+
+        required = {"EXCH", "SERIES", "INSTRUMENT_NAME", "SECURITY_ID"}
+        missing  = required - set(df.columns)
+        if missing:
+            logger.error(
+                f"Equity CSV missing required columns: {missing}. "
+                f"Available: {df.columns.tolist()}"
+            )
+            return []
+
         try:
             filtered = df[
                 (df["EXCH"]            == "NSE") &
                 (df["SERIES"]          == "EQ") &
                 (df["INSTRUMENT_NAME"] == "EQUITY")
             ].copy()
-        except KeyError as e:
-            logger.error(
-                f"Equity filter error — missing column: {e}. "
-                f"Available: {df.columns.tolist()}"
-            )
+        except Exception as e:
+            logger.error(f"Equity filter error: {e}")
             return []
+
+        logger.info(f"Equity after filter: {len(filtered)} rows")
 
         instruments = []
         for _, row in filtered.iterrows():
             try:
-                sid  = str(row["SECURITY_ID"])
-                name = str(
-                    row.get("SYMBOL_NAME") or
-                    row.get("TRADING_SYMBOL") or
-                    sid
-                )
+                sid  = str(row["SECURITY_ID"]).strip()
+                name = self._best_name(row, fallback=sid)
                 instruments.append({
                     "name":            name,
                     "scrip_code":      f"NSE_{sid}",
@@ -154,8 +191,8 @@ class FullMarketScanner:
                     "product":         "CNC",
                     "exchange":        "NSE",
                     "instrument_type": "EQUITY",
-                    "tick_size":       float(row.get("TICK_SIZE", 0.05)),
-                    "lot_units":       int(row.get("LOT_UNITS", 1)),
+                    "tick_size":       float(row.get("TICK_SIZE") or 0.05),
+                    "lot_units":       int(row.get("LOT_UNITS") or 1),
                 })
             except Exception as e:
                 logger.warning(f"Skipping equity row: {e}")
@@ -166,35 +203,44 @@ class FullMarketScanner:
     def _parse_fno(self, df: pd.DataFrame) -> list:
         """
         Filter FNO CSV to current-month futures only.
-        scrip_code uses NFO_ prefix to match /market/quotes API format.
-        ws_token uses NFO: prefix for WebSocket subscriptions.
-        Both confirmed from API docs: SEGMENT_TOKEN and SEGMENT:TOKEN formats.
+
+        NOTE: The quotes API (/market/quotes/full) returns 400 for
+        NFO_ scrip codes. FNO instruments are therefore shortlisted
+        from CSV data alone via _shortlist_fno_from_csv() — no
+        quotes API call is made for FNO instruments.
+
+        scrip_code → NFO_<SECURITY_ID>  (stored for order placement)
+        ws_token   → NFO:<SECURITY_ID>  (WebSocket subscription)
         """
         df.columns = df.columns.str.strip()
+
+        required = {"INSTRUMENT_NAME", "EXPIRY_FLAG", "SECURITY_ID"}
+        missing  = required - set(df.columns)
+        if missing:
+            logger.error(
+                f"FNO CSV missing required columns: {missing}. "
+                f"Available: {df.columns.tolist()}"
+            )
+            return []
+
         try:
             filtered = df[
                 (df["INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX"])) &
                 (df["EXPIRY_FLAG"] == "M")
             ].copy()
-        except KeyError as e:
-            logger.error(
-                f"FNO filter error — missing column: {e}. "
-                f"Available: {df.columns.tolist()}"
-            )
+        except Exception as e:
+            logger.error(f"FNO filter error: {e}")
             return []
+
+        logger.info(f"FNO after filter: {len(filtered)} rows")
 
         instruments = []
         for _, row in filtered.iterrows():
             try:
-                sid  = str(row["SECURITY_ID"])
-                name = str(
-                    row.get("SYMBOL_NAME") or
-                    row.get("TRADING_SYMBOL") or
-                    sid
-                )
-                inst_name = str(row.get("INSTRUMENT_NAME", "FUTSTK"))
+                sid  = str(row["SECURITY_ID"]).strip()
+                base = self._best_name(row, fallback=sid)
                 instruments.append({
-                    "name":            f"{name} Fut",
+                    "name":            f"{base} Fut",
                     "scrip_code":      f"NFO_{sid}",
                     "security_id":     sid,
                     "ws_token":        f"NFO:{sid}",
@@ -202,9 +248,9 @@ class FullMarketScanner:
                     "product":         "MARGIN",
                     "exchange":        "NSE",
                     "instrument_type": "FUTURES",
-                    "lot_size":        int(row.get("LOT_UNITS", 1)),
-                    "expiry":          str(row.get("EXPIRY_DATE", "")),
-                    "tick_size":       float(row.get("TICK_SIZE", 0.05)),
+                    "lot_size":        int(row.get("LOT_UNITS") or 1),
+                    "expiry":          str(row.get("EXPIRY_DATE") or ""),
+                    "tick_size":       float(row.get("TICK_SIZE") or 0.05),
                 })
             except Exception as e:
                 logger.warning(f"Skipping FNO row: {e}")
@@ -214,35 +260,25 @@ class FullMarketScanner:
 
     def _parse_index(self, df: pd.DataFrame) -> list:
         """
-        Parse index instruments.
-        Falls back to SECURITY_ID as name if no name column exists
-        (index CSV only has EXCH, SEGMENT, SECURITY_ID).
+        Index CSV only has EXCH, SEGMENT, SECURITY_ID guaranteed.
+        _best_name() falls back to SECURITY_ID when no name column exists.
         """
         df.columns = df.columns.str.strip()
-        logger.info(f"Index CSV columns: {df.columns.tolist()}")
 
-        name_col = None
-        for col in ["SYMBOL_NAME", "TRADING_SYMBOL",
-                    "CUSTOM_SYMBOL", "INSTRUMENT_NAME"]:
-            if col in df.columns:
-                name_col = col
-                logger.info(f"Using index name column: {name_col}")
-                break
-
-        if name_col is None:
-            logger.warning(
-                f"No name column found in index CSV. "
-                f"Available: {df.columns.tolist()}. "
-                f"Falling back to SECURITY_ID."
+        if "SECURITY_ID" not in df.columns:
+            logger.error(
+                f"Index CSV missing SECURITY_ID. "
+                f"Available: {df.columns.tolist()}"
             )
-            name_col = "SECURITY_ID"
+            return []
 
         instruments = []
         for _, row in df.iterrows():
             try:
-                sid = str(row["SECURITY_ID"])
+                sid  = str(row["SECURITY_ID"]).strip()
+                name = self._best_name(row, fallback=sid)
                 instruments.append({
-                    "name":            str(row[name_col]),
+                    "name":            name,
                     "scrip_code":      f"NIDX_{sid}",
                     "security_id":     sid,
                     "ws_token":        f"NIDX:{sid}",
@@ -261,19 +297,25 @@ class FullMarketScanner:
     # ── Tier 1: Score and shortlist ───────────────────────────
 
     def tier1_scan(self):
-        logger.info("🔍 Tier 1: Scoring full market universe...")
+        logger.info(
+            "🔍 Tier 1: equity via quotes API | "
+            "FNO via CSV-only shortlist (no quotes API call)"
+        )
         start = time.time()
 
-        equity_shortlist = self._score_batch(
+        # Equity — scored via /market/quotes/full (NSE_ prefix works)
+        equity_shortlist = self._score_batch_equity(
             self.universe_equity,
-            min_price=self.MIN_PRICE_EQUITY,
-            top_n=self.TIER1_SHORTLIST
+            min_price = self.MIN_PRICE_EQUITY,
+            top_n     = self.TIER1_SHORTLIST
         )
-        fno_shortlist = self._score_batch(
+
+        # FNO — CSV-only, no quotes API call (NFO_ prefix causes 400)
+        fno_shortlist = self._shortlist_fno_from_csv(
             self.universe_fno,
-            min_price=self.MIN_PRICE_FNO,
-            top_n=self.TIER1_SHORTLIST // 5
+            top_n = self.TIER1_SHORTLIST // 5
         )
+
         index_shortlist = self.universe_index[:10]
 
         with self._lock:
@@ -282,36 +324,37 @@ class FullMarketScanner:
             self.shortlist_index  = index_shortlist
             self._last_tier1      = time.time()
 
-        elapsed   = time.time() - start
-        top_names = [s["name"] for s in equity_shortlist[:5]]
+        elapsed  = time.time() - start
+        top_eq   = [s["name"] for s in equity_shortlist[:5]]
+        top_fno  = [s["name"] for s in fno_shortlist[:3]]
         logger.info(
             f"✅ Tier 1 complete in {elapsed:.1f}s | "
             f"Equity: {len(equity_shortlist)} | "
             f"FNO: {len(fno_shortlist)} | "
-            f"Top 5: {top_names}"
+            f"Top equity: {top_eq} | "
+            f"Top FNO: {top_fno}"
         )
 
-    def _score_batch(self, instruments: list,
-                     min_price: float,
-                     top_n: int) -> list:
+    def _score_batch_equity(self, instruments: list,
+                            min_price: float,
+                            top_n: int) -> list:
         """
-        Batch-fetch quotes for up to BATCH_SIZE instruments at a time.
+        Batch-fetch quotes for equity instruments only.
+        NSE_<id> scrip code format confirmed working for equity.
         Score by volume + volatility + momentum.
-        Return top N scored instruments.
-        scrip_code format NSE_TOKEN / NFO_TOKEN matches API docs exactly.
+        Returns top N scored instruments.
         """
         if not instruments:
             return []
 
-        scored     = []
-        batch_size = self.BATCH_SIZE
-        total      = len(instruments)
+        scored        = []
+        total         = len(instruments)
+        total_batches = (total + self.BATCH_SIZE - 1) // self.BATCH_SIZE
 
-        for i in range(0, total, batch_size):
-            batch       = instruments[i:i + batch_size]
-            scrip_codes = ",".join([inst["scrip_code"] for inst in batch])
-            batch_num   = i // batch_size + 1
-            total_batches = (total + batch_size - 1) // batch_size
+        for i in range(0, total, self.BATCH_SIZE):
+            batch       = instruments[i:i + self.BATCH_SIZE]
+            scrip_codes = ",".join(inst["scrip_code"] for inst in batch)
+            batch_num   = i // self.BATCH_SIZE + 1
 
             try:
                 quotes = self.api._request(
@@ -321,7 +364,7 @@ class FullMarketScanner:
 
                 if not quotes or "data" not in quotes:
                     logger.warning(
-                        f"Batch {batch_num}/{total_batches}: "
+                        f"Equity batch {batch_num}/{total_batches}: "
                         f"empty/bad response "
                         f"(sample: {scrip_codes[:60]}...)"
                     )
@@ -335,24 +378,26 @@ class FullMarketScanner:
                     if not data:
                         continue
 
-                    price  = data.get("live_price", 0)
-                    volume = data.get("volume", 0)
-                    change = abs(data.get("day_change_percentage", 0))
-                    high   = data.get("day_high", price)
-                    low    = data.get("day_low",  price)
+                    price  = float(data.get("live_price") or 0)
+                    volume = float(data.get("volume") or 0)
+                    change = abs(float(
+                        data.get("day_change_percentage") or 0
+                    ))
+                    high   = float(data.get("day_high") or price)
+                    low    = float(data.get("day_low")  or price)
 
                     if price < min_price:
                         continue
                     if volume < self.MIN_VOLUME:
                         continue
 
-                    vol_score = min(volume / 1_000_000, 40)
-                    atr_pct   = (
+                    vol_score   = min(volume / 1_000_000, 40)
+                    atr_pct     = (
                         (high - low) / price * 100
                         if price > 0 else 0
                     )
-                    atr_score = min(atr_pct * 10, 40)
-                    mom_score = min(change * 4, 20)
+                    atr_score   = min(atr_pct * 10, 40)
+                    mom_score   = min(change * 4, 20)
                     total_score = vol_score + atr_score + mom_score
 
                     scored.append({
@@ -360,18 +405,18 @@ class FullMarketScanner:
                         "score":  round(total_score, 2),
                         "ltp":    price,
                         "volume": volume,
-                        "change": change
+                        "change": change,
                     })
                     hits += 1
 
                 logger.debug(
-                    f"Batch {batch_num}/{total_batches}: "
-                    f"{hits}/{len(batch)} instruments scored"
+                    f"Equity batch {batch_num}/{total_batches}: "
+                    f"{hits}/{len(batch)} scored"
                 )
 
             except Exception as e:
                 logger.error(
-                    f"Batch {batch_num}/{total_batches} score error "
+                    f"Equity batch {batch_num}/{total_batches} error "
                     f"(sample: {scrip_codes[:60]}...): {e}"
                 )
 
@@ -379,10 +424,70 @@ class FullMarketScanner:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         logger.info(
-            f"Scoring complete: {len(scored)} passed filters, "
+            f"Equity scoring complete: {len(scored)} passed filters, "
             f"returning top {min(top_n, len(scored))}"
         )
         return scored[:top_n]
+
+    def _shortlist_fno_from_csv(self, instruments: list,
+                                top_n: int) -> list:
+        """
+        Selects top FNO futures from the CSV universe without
+        calling the quotes API (which returns 400 for NFO_ prefix).
+
+        Priority:
+          1. Index futures (NIFTY, BANKNIFTY, FINNIFTY, etc.)
+             — always most liquid, always included first
+          2. Stock futures sorted by lot_size descending
+             — higher lot_size = more institutionally traded
+
+        Each instrument gets score=0 and ltp=0 as defaults.
+        Real price is fetched via WS or REST LTP when run_cycle
+        scans the instrument.
+        """
+        if not instruments:
+            return []
+
+        index_names = {
+            "NIFTY", "BANKNIFTY", "FINNIFTY",
+            "MIDCPNIFTY", "SENSEX", "BANKEX"
+        }
+
+        index_futs = []
+        stock_futs = []
+
+        for inst in instruments:
+            name_upper = inst["name"].upper()
+            is_index   = any(n in name_upper for n in index_names)
+            if is_index:
+                index_futs.append(inst)
+            else:
+                stock_futs.append(inst)
+
+        stock_futs.sort(
+            key=lambda x: x.get("lot_size", 0),
+            reverse=True
+        )
+
+        combined = index_futs + stock_futs
+
+        result = []
+        for inst in combined[:top_n]:
+            result.append({
+                **inst,
+                "score":  0.0,
+                "ltp":    0.0,
+                "volume": 0,
+                "change": 0.0,
+            })
+
+        logger.info(
+            f"FNO shortlist (CSV-only): "
+            f"{len(index_futs)} index futures + "
+            f"{len(stock_futs)} stock futures available | "
+            f"returning top {len(result)}"
+        )
+        return result
 
     # ── Public API ────────────────────────────────────────────
 

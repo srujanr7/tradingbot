@@ -348,6 +348,20 @@ class FullMarketScanner:
         if not instruments:
             return []
 
+        nifty_change = 0.0
+
+        try:
+            idx = self.api._request(
+                "GET",
+                "/market/quotes/full",
+                params={"scrip-codes": "NSE_26000"}  # NIFTY index id
+            )
+            if idx and "data" in idx:
+                data = list(idx["data"].values())[0]
+                nifty_change = float(data.get("day_change_percentage") or 0)
+        except Exception:
+            pass
+
         scored        = []
         total         = len(instruments)
         total_batches = (total + self.BATCH_SIZE - 1) // self.BATCH_SIZE
@@ -399,7 +413,19 @@ class FullMarketScanner:
                     )
                     atr_score   = min(atr_pct * 10, 40)
                     mom_score   = min(change * 4, 20)
-                    total_score = vol_score + atr_score + mom_score
+                    volume_spike = volume / 1_000_000
+
+                    if volume_spike > 5:
+                        vol_score += 10
+                        
+                    rs_score = (change - nifty_change) * 10
+
+                    total_score = (
+                        vol_score
+                        + atr_score
+                        + mom_score
+                        + rs_score
+                    )
 
                     scored.append({
                         **inst,
@@ -527,5 +553,6 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
+
 
 

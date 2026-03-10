@@ -17,7 +17,7 @@ RETRAIN_DAY      = "sunday"
 RETRAIN_TIME     = "18:30"
 
 # ── Bot Cycle ─────────────────────────────────────────────────
-CYCLE_INTERVAL_SECONDS = 60
+CYCLE_INTERVAL_SECONDS = 5
 
 # ── ML Settings ───────────────────────────────────────────────
 CANDLE_INTERVAL   = "auto"   # "auto" = per-instrument best interval
@@ -60,3 +60,4 @@ LOG_LEVEL = "INFO"
 # ── Position Slots ────────────────────────────────────────────
 MAX_EQUITY_POS = 3
 MAX_FNO_POS    = 2
+

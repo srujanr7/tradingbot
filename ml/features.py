@@ -27,10 +27,17 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f["ema_9_cross_21"]  = (f["ema_9"]  > f["ema_21"]).astype(int)
     f["ema_21_cross_50"] = (f["ema_21"] > f["ema_50"]).astype(int)
 
-    macd_ind       = ta.trend.MACD(df["close"])
+    # ── MACD ───────────────────────────────────────────────────
+    macd_ind = ta.trend.MACD(df["close"])
+    
     f["macd"]      = macd_ind.macd()
     f["macd_sig"]  = macd_ind.macd_signal()
     f["macd_hist"] = macd_ind.macd_diff()
+    
+    # Compatibility with older model feature names
+    f["MACD_12_26_9"]  = f["macd"]
+    f["MACDs_12_26_9"] = f["macd_sig"]
+    f["MACDh_12_26_9"] = f["macd_hist"]
 
     # ── Momentum ──────────────────────────────────────────────
     f["rsi_14"] = ta.momentum.rsi(df["close"], window=14)
@@ -50,6 +57,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f["bb_pos"]   = (df["close"] - f["bb_lower"]) / (
         f["bb_upper"] - f["bb_lower"] + 1e-9
     )
+    # Compatibility column expected by some models
+    f["BBP_5_2.0"] = f["bb_pos"]
     f["atr_14"]   = ta.volatility.average_true_range(
         df["high"], df["low"], df["close"], window=14
     )
@@ -95,3 +104,4 @@ def build_labels(df: pd.DataFrame, horizon: int = 3,
     labels[future_return >  threshold] = 1
     labels[future_return < -threshold] = 0
     return labels
+

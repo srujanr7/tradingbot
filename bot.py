@@ -218,11 +218,16 @@ def get_candles(cfg: dict):
     time.sleep(0.25)
 
     df = api.get_historical(
-        cfg["scrip_code"],
-        interval,
-        start_time,
-        end_time
+    scrip_code = cfg["scrip_code"],
+    interval   = interval,
+    start_time = start_time,
+    end_time   = end_time
     )
+    
+    if df is None:
+        return None
+
+    logger.debug(f"{cfg['name']} candles loaded: {len(df)}")
 
     CANDLE_CACHE[key] = (time.time(), df)
 

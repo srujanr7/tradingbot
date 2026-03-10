@@ -84,6 +84,17 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Drop NaN rows but KEEP the original index intact
     # so build_labels() called on the same df stays aligned
+    required_cols = [
+    "MACD_12_26_9",
+    "MACDs_12_26_9",
+    "MACDh_12_26_9",
+    "BBP_5_2.0"
+    ]
+    
+    for col in required_cols:
+        if col not in f.columns:
+            f[col] = 0
+    
     return f.dropna()
 
 
@@ -104,4 +115,5 @@ def build_labels(df: pd.DataFrame, horizon: int = 3,
     labels[future_return >  threshold] = 1
     labels[future_return < -threshold] = 0
     return labels
+
 

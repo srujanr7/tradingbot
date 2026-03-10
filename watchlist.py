@@ -7,6 +7,32 @@ import os
 import pandas as pd
 from api import INDstocksAPI
 
+SECTOR_MOMENTUM = {
+    "BANK": 0,
+    "FINANCE": 0,
+    "NBFC": 0,
+    "IT": 0,
+    "AUTO": 0,
+    "METAL": 0,
+    "PHARMA": 0,
+    "ENERGY": 0,
+    "OIL_GAS": 0,
+    "POWER": 0,
+    "INFRA": 0,
+    "REALTY": 0,
+    "FMCG": 0,
+    "CHEMICAL": 0,
+    "CEMENT": 0,
+    "TEXTILE": 0,
+    "MEDIA": 0,
+    "CONSUMER": 0,
+    "DEFENCE": 0,
+    "TELECOM": 0,
+    "LOGISTICS": 0,
+    "AGRI": 0,
+    "OTHER": 0
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -147,6 +173,63 @@ class FullMarketScanner:
             if val and str(val).strip() and str(val).strip() != "nan":
                 return str(val).strip()
         return fallback
+
+    def _detect_sector(self, name: str):
+
+        name = name.upper()
+    
+        if "BANK" in name:
+            return "BANK"
+    
+        if "FINANCE" in name or "NBFC" in name:
+            return "FINANCE"
+    
+        if "TECH" in name or "INFY" in name or "TCS" in name or "WIPRO" in name:
+            return "IT"
+    
+        if "AUTO" in name or "MOTOR" in name:
+            return "AUTO"
+    
+        if "STEEL" in name or "METAL" in name:
+            return "METAL"
+    
+        if "PHARMA" in name:
+            return "PHARMA"
+    
+        if "OIL" in name or "GAS" in name:
+            return "OIL_GAS"
+    
+        if "POWER" in name:
+            return "POWER"
+    
+        if "INFRA" in name or "ENGINEER" in name:
+            return "INFRA"
+    
+        if "REALTY" in name or "ESTATE" in name:
+            return "REALTY"
+    
+        if "FMCG" in name or "CONSUMER" in name:
+            return "FMCG"
+    
+        if "CHEM" in name:
+            return "CHEMICAL"
+    
+        if "CEMENT" in name:
+            return "CEMENT"
+    
+        if "TEXTILE" in name:
+            return "TEXTILE"
+    
+        if "MEDIA" in name:
+            return "MEDIA"
+    
+        if "DEFENCE" in name:
+            return "DEFENCE"
+    
+        if "TELECOM" in name:
+            return "TELECOM"
+    
+        return "OTHER"
 
     def _parse_equity(self, df: pd.DataFrame) -> list:
         """
@@ -408,6 +491,21 @@ class FullMarketScanner:
                     if price <= 0:
                         continue
 
+                    # ── Liquidity filter (institutional style)
+                    if volume < 200000:
+                        continue
+
+                    if atr_pct < 1.2:
+                        continue
+
+
+                    sector = self._detect_sector(inst["name"])
+
+                    # Skip weak sectors
+                    if sector in SECTOR_MOMENTUM:
+                        if SECTOR_MOMENTUM[sector] < 0:
+                            continue
+
                     if price < min_price:
                         continue
                     if volume < self.MIN_VOLUME:
@@ -558,6 +656,7 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
+
 
 
 

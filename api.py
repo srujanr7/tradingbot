@@ -131,12 +131,18 @@ class INDstocksAPI:
             }
         )
     
-        if not resp or "data" not in resp:
+        if not resp:
+            print("Historical API returned empty response")
+            return None
+    
+        if resp.get("status") != "success":
+            print("Historical API error:", resp)
             return None
     
         candles = resp["data"].get("candles", [])
     
         if not candles:
+            print("Historical API returned 0 candles")
             return None
     
         import pandas as pd

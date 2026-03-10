@@ -119,46 +119,34 @@ class INDstocksAPI:
         )
         return data["data"] if data else {}
 
-    def get_historical(self, scrip_code: str, interval: str,
-                       start_ms: int, end_ms: int):
-        """
-        Get OHLCV candles.
+    def get_historical(self, scrip_code, interval, start_time, end_time):
 
-        scrip_code must be in SEGMENT_TOKEN format:
-          NSE equity  → NSE_<security_id>  e.g. NSE_3045
-          NFO futures → NFO_<security_id>  e.g. NFO_51011
-
-        interval: '1minute','5minute','15minute','60minute','1day' etc.
-        start_ms / end_ms: Unix epoch milliseconds (IST).
-
-        Returns a pandas DataFrame with columns:
-          [timestamp, open, high, low, close, volume]
-        or None if no data.
-        """
-        import pandas as pd
-        data = self._request(
-            "GET", f"/market/historical/{interval}",
+        resp = self._request(
+            "GET",
+            f"/market/historical/{interval}",
             params={
                 "scrip-codes": scrip_code,
-                "start_time":  start_ms,
-                "end_time":    end_ms,
+                "start_time": start_time,
+                "end_time": end_time
             }
         )
-        if data and data.get("data") and "candles" in data["data"]:
-            candles = data["data"]["candles"]
-            if not candles:
-                return None
-            df = pd.DataFrame(
-                candles,
-                columns=["timestamp", "open", "high",
-                         "low", "close", "volume"]
-            )
-            df["timestamp"] = pd.to_datetime(
-                df["timestamp"], unit="ms"
-            )
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            return df
-        return None
+    
+        if not resp or "data" not in resp:
+            return None
+    
+        candles = resp["data"].get("candles", [])
+    
+        if not candles:
+            return None
+    
+        import pandas as pd
+    
+        df = pd.DataFrame(
+            candles,
+            columns=["timestamp","open","high","low","close","volume"]
+        )
+    
+        return df
 
     # ── Orders ────────────────────────────────────────────────
 

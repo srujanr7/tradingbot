@@ -405,16 +405,17 @@ class FullMarketScanner:
                     high   = float(data.get("day_high") or price)
                     low    = float(data.get("day_low")  or price)
 
+                    if price <= 0:
+                        continue
+
                     if price < min_price:
                         continue
                     if volume < self.MIN_VOLUME:
                         continue
 
                     vol_score   = min(volume / 1_000_000, 40)
-                    atr_pct     = (
-                        (high - low) / price * 100
-                        if price > 0 else 0
-                    )
+                    
+                    atr_pct = (high - low) / price * 100
                     atr_score   = min(atr_pct * 10, 40)
                     mom_score   = min(change * 4, 20)
                     volume_spike = volume / 1_000_000
@@ -557,6 +558,7 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
+
 
 
 

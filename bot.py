@@ -212,6 +212,9 @@ def get_candles(cfg: dict):
     trainer = trainers.get(cfg["scrip_code"])
     interval = trainer.interval if trainer else config.CANDLE_INTERVAL
 
+    if interval == "auto":
+        interval = "5minute"
+
     end_time = int(time.time() * 1000)
     start_time = end_time - (6 * 24 * 60 * 60 * 1000)
 

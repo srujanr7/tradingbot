@@ -401,6 +401,12 @@ def run_cycle():
         return
 
     active = scanner.get_active()
+    logger.info(
+        f"📊 Scanner active instruments: {len(active)} | "
+        f"Segment={ACTIVE_SEGMENT} | "
+        f"Exchange={ACTIVE_EXCHANGE} | "
+        f"Instrument={ACTIVE_INSTRUMENT}"
+    )
     if not active:
         logger.warning("No active instruments.")
         return

@@ -216,7 +216,15 @@ def get_candles(cfg: dict):
         interval = "5minute"
 
     end_time = int(time.time() * 1000)
-    start_time = end_time - (6 * 24 * 60 * 60 * 1000)
+
+    # API limits
+    if interval in ["1minute","2minute","3minute","4minute","5minute",
+                    "10minute","15minute","30minute"]:
+        start_time = end_time - (7 * 24 * 60 * 60 * 1000)  # 7 days
+    elif interval in ["60minute","120minute","180minute","240minute"]:
+        start_time = end_time - (14 * 24 * 60 * 60 * 1000) # 14 days
+    else:
+        start_time = end_time - (7 * 24 * 60 * 60 * 1000)
 
     time.sleep(0.25)
 

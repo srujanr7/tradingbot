@@ -135,22 +135,35 @@ class INDstocksAPI:
             print("Historical API returned empty response")
             return None
     
-        if resp.get("status") != "success":
+        if resp.get("success") is False:
             print("Historical API error:", resp)
             return None
     
-        candles = resp["data"].get("candles", [])
+        data = resp.get("data", {})
+    
+        if not data:
+            print("Historical API returned empty data")
+            return None
+    
+        first_key = next(iter(data))
+        candles = data[first_key].get("candles")
     
         if not candles:
-            print("Historical API returned 0 candles")
+            print("Historical API returned no candles:", resp)
             return None
     
         import pandas as pd
     
-        df = pd.DataFrame(
-            candles,
-            columns=["timestamp","open","high","low","close","volume"]
-        )
+        df = pd.DataFrame(candles)
+    
+        df.rename(columns={
+            "ts": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume"
+        }, inplace=True)
     
         return df
 

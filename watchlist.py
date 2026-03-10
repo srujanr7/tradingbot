@@ -495,9 +495,10 @@ class FullMarketScanner:
                     if volume < 200000:
                         continue
 
+                    atr_pct = (high - low) / price * 100
+
                     if atr_pct < 1.2:
                         continue
-
 
                     sector = self._detect_sector(inst["name"])
 
@@ -512,8 +513,6 @@ class FullMarketScanner:
                         continue
 
                     vol_score   = min(volume / 1_000_000, 40)
-                    
-                    atr_pct = (high - low) / price * 100
                     atr_score   = min(atr_pct * 10, 40)
                     mom_score   = min(change * 4, 20)
                     volume_spike = volume / 1_000_000
@@ -656,6 +655,7 @@ class FullMarketScanner:
         thread.start()
         logger.info("✅ Background market scanner started")
         return thread
+
 
 
 

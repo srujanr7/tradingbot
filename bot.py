@@ -323,7 +323,15 @@ def _monitor_open_positions(active: list):
             continue
 
         ltp = _get_ltp_for_cfg(cfg)
+
+        # fallback if WS failed
+        if ltp is None:
+            logger.warning(f"LTP missing for {cfg['name']} — forcing REST fetch")
+            result = api.get_ltp(cfg["scrip_code"])
+            ltp = result.get(cfg["scrip_code"]) if result else None
+        
         if not ltp:
+            logger.warning(f"Still no LTP for {cfg['name']} — skipping exit check")
             continue
 
         ltp         = float(ltp)
@@ -708,7 +716,7 @@ def process_exit(cfg: dict, ltp: float,
         pnl        = closed.get("pnl", 0)
         pnl_pct    = (
             (exit_price - pos["entry"]) / pos["entry"] * 100
-            if pos["entry"] else 0
+            if pos["entry"] > 0 else 0
         )
         risk.update_pnl(pnl)
 
@@ -897,7 +905,7 @@ if __name__ == "__main__":
     notifier.start_command_listener(bot_ref=sys.modules[__name__])
 
     schedule.every(config.CYCLE_INTERVAL_SECONDS).seconds.do(run_cycle)
-    schedule.every(30).minutes.do(refresh_ws_subscriptions)
+    schedule.every(5).minutes.do(refresh_ws_subscriptions)
     schedule.every().day.at("06:30").do(refresh_token)
     schedule.every().day.at(config.DAILY_RESET_AT).do(daily_reset)
     schedule.every().day.at(config.SQUAREOFF_AT).do(square_off_all)

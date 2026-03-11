@@ -27,6 +27,10 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f["ema_9_cross_21"]  = (f["ema_9"]  > f["ema_21"]).astype(int)
     f["ema_21_cross_50"] = (f["ema_21"] > f["ema_50"]).astype(int)
 
+    f["trend_strength"] = ta.trend.adx(
+    df["high"], df["low"], df["close"], window=14
+    )
+
     # ── MACD ───────────────────────────────────────────────────
     macd_ind = ta.trend.MACD(df["close"])
     
@@ -120,6 +124,7 @@ def build_labels(df: pd.DataFrame, horizon: int = 3,
     labels[future_return >  threshold] = 1
     labels[future_return < -threshold] = 0
     return labels
+
 
 
 

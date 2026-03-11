@@ -50,16 +50,21 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f["stoch_d"] = stoch.stoch_signal()
 
     # ── Volatility ────────────────────────────────────────────
-    bb            = ta.volatility.BollingerBands(df["close"], window=20)
+    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+    
     f["bb_upper"] = bb.bollinger_hband()
     f["bb_lower"] = bb.bollinger_lband()
-    f["bb_width"] = (f["bb_upper"] - f["bb_lower"]) / df["close"]
-    f["bb_pos"]   = (df["close"] - f["bb_lower"]) / (
-        f["bb_upper"] - f["bb_lower"] + 1e-9
-    )
+    f["bb_mid"]   = bb.bollinger_mavg()
+    
+    band_range = f["bb_upper"] - f["bb_lower"]
+    
+    f["bb_width"] = band_range / df["close"]
+    f["bb_pos"]   = (df["close"] - f["bb_lower"]) / (band_range + 1e-9)
+    
     # Compatibility column expected by some models
     f["BBP_5_2.0"] = f["bb_pos"]
-    f["atr_14"]   = ta.volatility.average_true_range(
+    
+    f["atr_14"] = ta.volatility.average_true_range(
         df["high"], df["low"], df["close"], window=14
     )
 
@@ -115,5 +120,6 @@ def build_labels(df: pd.DataFrame, horizon: int = 3,
     labels[future_return >  threshold] = 1
     labels[future_return < -threshold] = 0
     return labels
+
 
 

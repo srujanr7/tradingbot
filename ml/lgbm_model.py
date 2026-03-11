@@ -52,8 +52,14 @@ class LGBMModel:
         df["macd_s"] = macd["MACDs_12_26_9"]
         df["macd_h"] = macd["MACDh_12_26_9"]
 
-        bb           = ta.bbands(df["close"])
-        df["bb_pct"] = bb["BBP_5_2.0"]
+        bb = ta.bbands(df["close"])
+        if "BBP_5_2.0" in bb.columns:
+            df["bb_pct"] = bb["BBP_5_2.0"]
+        else:
+            df["bb_pct"] = (df["close"] - bb["BBL_5_2.0"]) / (
+                bb["BBU_5_2.0"] - bb["BBL_5_2.0"] + 1e-9
+            )
+            
         df["atr"]    = ta.atr(df["high"], df["low"], df["close"])
 
         df["vol_ratio"] = df["volume"] / df["volume"].rolling(20).mean()

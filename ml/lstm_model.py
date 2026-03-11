@@ -84,8 +84,15 @@ class LSTMModel:
         macd        = ta.macd(df["close"])
         df["macd"]  = macd["MACD_12_26_9"]
         df["vol_r"] = df["volume"] / df["volume"].rolling(20).mean()
-        bb          = ta.bbands(df["close"])
-        df["bb_p"]  = bb["BBP_5_2.0"]
+        
+        bb = ta.bbands(df["close"])
+
+        if "BBP_5_2.0" in bb.columns:
+            df["bb_p"] = bb["BBP_5_2.0"]
+        else:
+            df["bb_p"] = (df["close"] - bb["BBL_5_2.0"]) / (
+                bb["BBU_5_2.0"] - bb["BBL_5_2.0"] + 1e-9
+            )
         df["atr"]   = ta.atr(df["high"], df["low"], df["close"]) / df["close"]
         df.dropna(inplace=True)
 
